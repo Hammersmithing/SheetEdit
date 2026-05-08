@@ -633,8 +633,13 @@ class SheetView(QTableWidget):
         self._MAX_UNDO = 50
         self.setItemDelegate(BorderDelegate(self))
         self.setShowGrid(True)  # light grid from stylesheet, borders drawn on top
+        # Google Sheets-style: typing goes straight into cells,
+        # double-click or F2 for inline editor
+        self.setEditTriggers(QTableWidget.DoubleClicked)
+        self._editing = False  # True when user is typing into a cell
         self._load()
         self.itemChanged.connect(self._on_item_changed)
+        self.currentCellChanged.connect(self._cell_moved)
         self._tracking_edits = True
 
     def _snapshot_cells(self, cells):
@@ -703,6 +708,9 @@ class SheetView(QTableWidget):
         self._undo_stack.append(current)
         self._restore_snapshot(new_snap)
 
+    def _cell_moved(self, row, col, prev_row, prev_col):
+        self._editing = False
+
     def _on_item_changed(self, item):
         """Track direct cell edits by the user."""
         if not self._tracking_edits:
@@ -716,21 +724,127 @@ class SheetView(QTableWidget):
         if hasattr(win, '_check_and_warn'):
             win._check_and_warn([(item.row(), item.column())])
 
+    def _ensure_item(self, row, col):
+        """Get or create a QTableWidgetItem at (row, col)."""
+        item = self.item(row, col)
+        if item is None:
+            item = QTableWidgetItem()
+            item.setForeground(QBrush(QColor("#202124")))
+            item.setBackground(QBrush(QColor("#FFFFFF")))
+            item.setFont(QFont("Arial", 11))
+            item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            self.setItem(row, col, item)
+        return item
+
     def keyPressEvent(self, event):
-        if event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
+        key = event.key()
+        mods = event.modifiers()
+
+        # If Qt's inline editor is open (F2 / double-click), let it handle everything
+        if self.state() == QTableWidget.EditingState:
+            if key in (Qt.Key_Return, Qt.Key_Enter):
+                super().keyPressEvent(event)
+                row, col = self.currentRow(), self.currentColumn()
+                if row < self.rowCount() - 1:
+                    self.setCurrentCell(row + 1, col)
+                self._editing = False
+                return
+            if key == Qt.Key_Escape:
+                super().keyPressEvent(event)
+                self._editing = False
+                return
+            super().keyPressEvent(event)
+            return
+
+        # Delete/Backspace: clear selected cells
+        if key in (Qt.Key_Delete, Qt.Key_Backspace):
+            if self._editing:
+                # Backspace while typing: remove last char
+                row, col = self.currentRow(), self.currentColumn()
+                item = self.item(row, col)
+                if item and item.text():
+                    self._tracking_edits = False
+                    item.setText(item.text()[:-1])
+                    self._tracking_edits = True
+                    win = self.window()
+                    if hasattr(win, '_update_formula_bar'):
+                        win._update_formula_bar()
+                else:
+                    self._editing = False
+                return
             items = self.selectedItems()
             if items:
-                coords = [(item.row(), item.column()) for item in items]
+                coords = [(it.row(), it.column()) for it in items]
                 self.push_undo(coords)
                 self._tracking_edits = False
-                for item in items:
-                    item.setText("")
+                for it in items:
+                    it.setText("")
                 self._tracking_edits = True
-                # Update formula bar
                 win = self.window()
                 if hasattr(win, '_update_formula_bar'):
                     win._update_formula_bar()
             return
+
+        # Enter/Return: move down
+        if key in (Qt.Key_Return, Qt.Key_Enter):
+            self._editing = False
+            row, col = self.currentRow(), self.currentColumn()
+            if row < self.rowCount() - 1:
+                self.setCurrentCell(row + 1, col)
+            return
+
+        # Tab / Shift+Tab: move right/left
+        if key == Qt.Key_Tab:
+            self._editing = False
+            row, col = self.currentRow(), self.currentColumn()
+            if mods & Qt.ShiftModifier:
+                if col > 0:
+                    self.setCurrentCell(row, col - 1)
+            else:
+                if col < self.columnCount() - 1:
+                    self.setCurrentCell(row, col + 1)
+            return
+
+        # Escape: stop typing mode
+        if key == Qt.Key_Escape:
+            self._editing = False
+            return
+
+        # F2: open Qt inline editor
+        if key == Qt.Key_F2:
+            self.editItem(self.currentItem())
+            return
+
+        # Arrow keys: navigate (stop typing mode)
+        if key in (Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down):
+            self._editing = False
+            super().keyPressEvent(event)
+            return
+
+        # Printable text: type directly into cell
+        text = event.text()
+        if text and text.isprintable() and not (mods & Qt.ControlModifier) and not (mods & Qt.MetaModifier):
+            row, col = self.currentRow(), self.currentColumn()
+            if row < 0 or col < 0:
+                return
+            item = self._ensure_item(row, col)
+            if not self._editing:
+                # First keystroke: push undo and replace content
+                self.push_undo([(row, col)])
+                self._tracking_edits = False
+                item.setText(text)
+                self._tracking_edits = True
+                self._editing = True
+            else:
+                # Subsequent keystrokes: append
+                self._tracking_edits = False
+                item.setText(item.text() + text)
+                self._tracking_edits = True
+            win = self.window()
+            if hasattr(win, '_update_formula_bar'):
+                win._update_formula_bar()
+            return
+
         super().keyPressEvent(event)
 
     def contextMenuEvent(self, event):
