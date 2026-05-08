@@ -1368,14 +1368,10 @@ class SheetEditWindow(QMainWindow):
 
         file_menu.addSeparator()
 
-        preview_act = QAction("Print Preview...", self)
+        preview_act = QAction("Print...", self)
+        preview_act.setShortcut(QKeySequence.Print)
         preview_act.triggered.connect(self._print_preview)
         file_menu.addAction(preview_act)
-
-        print_act = QAction("Print...", self)
-        print_act.setShortcut(QKeySequence.Print)
-        print_act.triggered.connect(self._print)
-        file_menu.addAction(print_act)
 
         edit_menu = mb.addMenu("Edit")
 
@@ -1918,6 +1914,7 @@ class SheetEditWindow(QMainWindow):
         return QPageLayout.Landscape
 
     def _print_preview(self):
+        from PySide6.QtPrintSupport import QPrintPreviewWidget
         sv = self._sheet()
         if sv is None:
             return
@@ -1925,6 +1922,22 @@ class SheetEditWindow(QMainWindow):
         printer.setPageOrientation(self._auto_orientation(sv))
         dialog = QPrintPreviewDialog(printer, self)
         dialog.paintRequested.connect(lambda p: self._render_sheet(p, sv))
+
+        # Find the preview widget inside the dialog
+        preview = dialog.findChild(QPrintPreviewWidget)
+
+        # Add portrait/landscape buttons to the preview toolbar
+        toolbars = dialog.findChildren(QToolBar)
+        if toolbars and preview:
+            tb = toolbars[0]
+            tb.addSeparator()
+            portrait_act = QAction("Portrait", dialog)
+            portrait_act.triggered.connect(preview.setPortraitOrientation)
+            tb.addAction(portrait_act)
+            landscape_act = QAction("Landscape", dialog)
+            landscape_act.triggered.connect(preview.setLandscapeOrientation)
+            tb.addAction(landscape_act)
+
         dialog.exec()
 
     def _print(self):
