@@ -1280,6 +1280,568 @@ class RulesEditor(QDialog):
         return self._rules
 
 
+# ── Import Pipeline (OCR + Ollama) ───────────────────────────────────────────
+
+OLLAMA_MODEL = "llama3.3:latest"
+OLLAMA_URL = "http://localhost:11434/api/chat"
+
+CALL_SHEET_SYSTEM_PROMPT = """You are a JSON data extractor. You ONLY output valid JSON. No explanations, no markdown, no commentary. Just a single JSON object."""
+
+CALL_SHEET_USER_PROMPT = """Extract crew/call sheet data from the text below into this exact JSON format:
+{"production":"","date":"","location":"","call_time":"","crew":[{"name":"","role":"","call_time":"","wrap_time":"","phone":"","notes":""}]}
+
+Rules:
+- Extract ALL people/crew members
+- Use empty string for missing fields
+- Output ONLY the JSON object, nothing else
+
+Text:
+"""
+
+
+def _ocr_image(path):
+    """Extract text from an image using macOS Vision framework."""
+    try:
+        import Vision
+        from Cocoa import NSURL
+        from Quartz import CIImage
+
+        url = NSURL.fileURLWithPath_(str(path))
+        request = Vision.VNRecognizeTextRequest.alloc().init()
+        request.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
+        handler = Vision.VNImageRequestHandler.alloc().initWithURL_options_(url, {})
+        handler.performRequests_error_([request], None)
+
+        results = request.results()
+        if not results:
+            return ""
+        lines = []
+        for obs in results:
+            text = obs.topCandidates_(1)[0].string()
+            lines.append(text)
+        return "\n".join(lines)
+    except Exception as e:
+        return f"[OCR Error: {e}]"
+
+
+def _extract_text_from_pdf(path):
+    """Extract text from a PDF using macOS Vision OCR."""
+    try:
+        import Vision
+        from Cocoa import NSURL
+        from Quartz import (
+            PDFDocument, CGPDFDocumentCreateWithURL,
+        )
+        import Quartz
+
+        url = NSURL.fileURLWithPath_(str(path))
+        pdf_doc = PDFDocument.alloc().initWithURL_(url)
+        if not pdf_doc:
+            return "[Could not open PDF]"
+
+        all_text = []
+        for i in range(pdf_doc.pageCount()):
+            page = pdf_doc.pageAtIndex_(i)
+            page_text = page.string()
+            if page_text:
+                all_text.append(page_text)
+            else:
+                # Fall back to OCR for scanned pages
+                # Get page as image and OCR it
+                pass
+        return "\n".join(all_text) if all_text else "[No text found in PDF]"
+    except Exception as e:
+        return f"[PDF Error: {e}]"
+
+
+def _extract_text_from_xlsx(path):
+    """Extract text from an xlsx file."""
+    try:
+        wb = openpyxl.load_workbook(path)
+        lines = []
+        for ws in wb.worksheets:
+            for row in ws.iter_rows(values_only=True):
+                vals = [str(v) for v in row if v is not None]
+                if vals:
+                    lines.append("\t".join(vals))
+        return "\n".join(lines)
+    except Exception as e:
+        return f"[XLSX Error: {e}]"
+
+
+def _extract_text_from_file(path):
+    """Route file to appropriate text extractor."""
+    p = Path(path)
+    suffix = p.suffix.lower()
+    if suffix in (".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".heic", ".webp"):
+        return _ocr_image(str(p))
+    elif suffix == ".pdf":
+        return _extract_text_from_pdf(str(p))
+    elif suffix == ".xlsx":
+        return _extract_text_from_xlsx(str(p))
+    elif suffix in (".txt", ".csv"):
+        return p.read_text(errors="replace")
+    else:
+        return f"[Unsupported file type: {suffix}]"
+
+
+def _query_ollama(system_prompt, user_prompt):
+    """Send a chat to Ollama and return the response text."""
+    import requests
+    try:
+        resp = requests.post(OLLAMA_URL, json={
+            "model": OLLAMA_MODEL,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "format": "json",
+            "stream": False,
+        }, timeout=300)
+        resp.raise_for_status()
+        return resp.json().get("message", {}).get("content", "")
+    except Exception as e:
+        return f"[Ollama Error: {e}]"
+
+
+def _parse_call_sheet_data(raw_text, log_fn=None):
+    """Send extracted text to Ollama to parse into structured JSON."""
+    user_msg = CALL_SHEET_USER_PROMPT + raw_text
+    response = _query_ollama(CALL_SHEET_SYSTEM_PROMPT, user_msg)
+
+    if response.startswith("[Ollama"):
+        if log_fn:
+            log_fn(response)
+        return None
+
+    if log_fn:
+        # Show first 300 chars of response for debugging
+        preview = response[:300].replace("\n", " ")
+        log_fn(f"AI response preview: {preview}...")
+
+    # Strip <think>...</think> blocks (deepseek-r1)
+    import re
+    cleaned = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL).strip()
+
+    # Strip markdown code fences
+    if "```" in cleaned:
+        lines = cleaned.split("\n")
+        lines = [l for l in lines if not l.strip().startswith("```")]
+        cleaned = "\n".join(lines)
+
+    # Find JSON object — look for outermost { }
+    start = cleaned.find("{")
+    end = cleaned.rfind("}") + 1
+    if start >= 0 and end > start:
+        json_str = cleaned[start:end]
+        try:
+            return json.loads(json_str)
+        except json.JSONDecodeError as e:
+            if log_fn:
+                log_fn(f"JSON parse error: {e}")
+                log_fn(f"JSON snippet: {json_str[:200]}...")
+
+    if log_fn:
+        log_fn(f"Full response length: {len(response)} chars")
+    return None
+
+
+def _fill_call_sheet(wb, data):
+    """Fill a call sheet workbook with structured data. Returns the workbook."""
+    ws = wb.active
+
+    # Header info
+    if data.get("production"):
+        ws.cell(row=3, column=2, value=data["production"])
+    if data.get("date"):
+        ws.cell(row=4, column=2, value=data["date"])
+    if data.get("location"):
+        ws.cell(row=5, column=2, value=data["location"])
+    if data.get("call_time"):
+        ws.cell(row=6, column=2, value=data["call_time"])
+
+    # Crew rows starting at row 9
+    crew = data.get("crew", [])
+    for i, member in enumerate(crew):
+        row = 9 + i
+        ws.cell(row=row, column=1, value=member.get("name", ""))
+        ws.cell(row=row, column=2, value=member.get("role", ""))
+        ws.cell(row=row, column=3, value=member.get("call_time", ""))
+        ws.cell(row=row, column=4, value=member.get("wrap_time", ""))
+        ws.cell(row=row, column=5, value=member.get("phone", ""))
+        ws.cell(row=row, column=6, value=member.get("notes", ""))
+
+        # Apply consistent formatting to each crew row
+        for c in range(1, 7):
+            cell = ws.cell(row=row, column=c)
+            cell.font = XlFont(name="Arial", size=11)
+            cell.alignment = Alignment(vertical="center")
+            # Alternating row fill
+            if i % 2 == 1:
+                cell.fill = PatternFill(
+                    start_color="FFF2E6", end_color="FFF2E6", fill_type="solid"
+                )
+            # Light borders
+            cell.border = Border(
+                top=Side(style="thin", color="DADCE0"),
+                bottom=Side(style="thin", color="DADCE0"),
+                left=Side(style="thin", color="DADCE0"),
+                right=Side(style="thin", color="DADCE0"),
+            )
+
+    return wb
+
+
+# ── Import Progress Dialog ──────────────────────────────────────────────────
+
+SUPPORTED_IMPORT_EXTS = {".xlsx", ".pdf", ".png", ".jpg", ".jpeg", ".tiff", ".heic", ".webp", ".bmp", ".csv", ".txt"}
+
+
+class DropZoneLabel(QLabel):
+    """A label that accepts drag-and-drop files."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.setAlignment(Qt.AlignCenter)
+        self.setText("Drop files here\n\nImages, PDFs, Spreadsheets\n\nor click Add Files below")
+        self.setMinimumHeight(120)
+        self.setStyleSheet(
+            "QLabel { border: 2px dashed #BFBFBF; border-radius: 8px; "
+            "color: #5F6368; font-size: 14px; padding: 20px; background: #F8F9FA; }"
+        )
+        self.files_dropped = None  # callback
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            self.setStyleSheet(
+                "QLabel { border: 2px dashed #1A73E8; border-radius: 8px; "
+                "color: #1A73E8; font-size: 14px; padding: 20px; background: #E8F0FE; }"
+            )
+
+    def dragLeaveEvent(self, event):
+        self.setStyleSheet(
+            "QLabel { border: 2px dashed #BFBFBF; border-radius: 8px; "
+            "color: #5F6368; font-size: 14px; padding: 20px; background: #F8F9FA; }"
+        )
+
+    def dropEvent(self, event):
+        self.setStyleSheet(
+            "QLabel { border: 2px dashed #BFBFBF; border-radius: 8px; "
+            "color: #5F6368; font-size: 14px; padding: 20px; background: #F8F9FA; }"
+        )
+        files = []
+        for url in event.mimeData().urls():
+            path = url.toLocalFile()
+            if path and Path(path).suffix.lower() in SUPPORTED_IMPORT_EXTS:
+                files.append(path)
+        if files and self.files_dropped:
+            self.files_dropped(files)
+
+
+class ImportCallSheetDialog(QDialog):
+    """Dialog that imports files, extracts text, queries Ollama, and fills a call sheet."""
+
+    def __init__(self, files=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Import Call Sheet Data")
+        self.setMinimumSize(550, 400)
+        self.files = list(files) if files else []
+        self.result_wb = None
+        self._processing = False
+
+        layout = QVBoxLayout(self)
+
+        # Drop zone
+        self.drop_zone = DropZoneLabel()
+        self.drop_zone.files_dropped = self._add_files
+        layout.addWidget(self.drop_zone)
+
+        # File list
+        self.file_list = QListWidget()
+        layout.addWidget(self.file_list)
+
+        # Buttons row
+        btn_row = QHBoxLayout()
+        add_btn = QPushButton("Add Files...")
+        add_btn.clicked.connect(self._browse_files)
+        btn_row.addWidget(add_btn)
+
+        self.import_btn = QPushButton("Import")
+        self.import_btn.setStyleSheet(
+            "QPushButton { background-color: #1A73E8; color: white; "
+            "font-weight: bold; padding: 6px 20px; border-radius: 4px; }"
+            "QPushButton:hover { background-color: #1557B0; }"
+        )
+        self.import_btn.clicked.connect(self._start_import)
+        btn_row.addWidget(self.import_btn)
+
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(self.cancel_btn)
+        layout.addLayout(btn_row)
+
+        # Status / log (hidden until import starts)
+        self.status_label = QLabel("")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+        self.log_text = QListWidget()
+        self.log_text.setVisible(False)
+        layout.addWidget(self.log_text)
+
+        # Populate initial files
+        for f in self.files:
+            self.file_list.addItem(Path(f).name)
+
+    def _add_files(self, file_paths):
+        for f in file_paths:
+            if f not in self.files:
+                self.files.append(f)
+                self.file_list.addItem(Path(f).name)
+
+    def _browse_files(self):
+        files, _ = QFileDialog.getOpenFileNames(
+            self, "Add Files",
+            "",
+            "All Supported (*.xlsx *.pdf *.png *.jpg *.jpeg *.tiff *.heic *.csv *.txt);;"
+            "All Files (*)",
+        )
+        if files:
+            self._add_files(files)
+
+    def _start_import(self):
+        if not self.files:
+            QMessageBox.information(self, "Import", "Add some files first.")
+            return
+        self._processing = True
+        self.drop_zone.setVisible(False)
+        self.import_btn.setEnabled(False)
+        self.log_text.setVisible(True)
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(100, self._run_import)
+
+    def _log(self, msg):
+        self.log_text.addItem(msg)
+        self.log_text.scrollToBottom()
+        QApplication.processEvents()
+
+    def _run_import(self):
+        # Step 1: Extract text from all files
+        self.status_label.setText("Step 1/3: Extracting text from files...")
+        QApplication.processEvents()
+
+        all_text = []
+        for f in self.files:
+            self._log(f"Reading: {Path(f).name}")
+            text = _extract_text_from_file(f)
+            if text and not text.startswith("["):
+                all_text.append(text)
+                self._log(f"  Extracted {len(text)} characters")
+            else:
+                self._log(f"  {text}")
+
+        if not all_text:
+            self._log("No text could be extracted from the files.")
+            self.status_label.setText("Import failed — no text extracted.")
+            return
+
+        combined = "\n\n---\n\n".join(all_text)
+        self._log(f"Total text: {len(combined)} characters")
+
+        # Step 2: Parse with Ollama
+        self.status_label.setText(f"Step 2/3: Parsing with {OLLAMA_MODEL} (this may take a moment)...")
+        QApplication.processEvents()
+        self._log(f"Sending to {OLLAMA_MODEL}...")
+
+        data = _parse_call_sheet_data(combined, log_fn=self._log)
+
+        if data is None:
+            self._log("Failed to parse structured data from AI response.")
+            self.status_label.setText("Import failed — could not parse AI response.")
+            return
+
+        crew_count = len(data.get("crew", []))
+        self._log(f"Parsed: {crew_count} crew members")
+        if data.get("production"):
+            self._log(f"Production: {data['production']}")
+
+        # Step 3: Build call sheet
+        self.status_label.setText("Step 3/3: Building call sheet...")
+        QApplication.processEvents()
+
+        # Use the built-in call sheet template
+        builder = BUILTIN_TEMPLATES.get("Call Sheet")
+        if builder:
+            wb = builder()
+        else:
+            wb = openpyxl.Workbook()
+
+        self.result_wb = _fill_call_sheet(wb, data)
+        self._log(f"Call sheet built with {crew_count} crew rows.")
+        self.status_label.setText("Import complete!")
+        self.cancel_btn.setText("Done")
+        self.cancel_btn.clicked.disconnect()
+        self.cancel_btn.clicked.connect(self.accept)
+
+
+# ── Snippet Composer Dialog ─────────────────────────────────────────────────
+
+class SnippetComposer(QDialog):
+    """Pick and order snippets to build a document from blocks."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Build from Snippets")
+        self.setMinimumSize(600, 450)
+        self.result_wb = None
+
+        layout = QHBoxLayout(self)
+
+        # Left: available snippets
+        left = QVBoxLayout()
+        left.addWidget(QLabel("Available Snippets"))
+        self.avail_list = QListWidget()
+        for name in list_snippets():
+            self.avail_list.addItem(name)
+        left.addWidget(self.avail_list)
+
+        add_btn = QPushButton("Add >>")
+        add_btn.clicked.connect(self._add_snippet)
+        left.addWidget(add_btn)
+        layout.addLayout(left)
+
+        # Right: chosen snippets in order
+        right = QVBoxLayout()
+        right.addWidget(QLabel("Document Order"))
+        self.order_list = QListWidget()
+        right.addWidget(self.order_list)
+
+        btn_row = QHBoxLayout()
+        up_btn = QPushButton("Move Up")
+        up_btn.clicked.connect(self._move_up)
+        btn_row.addWidget(up_btn)
+        down_btn = QPushButton("Move Down")
+        down_btn.clicked.connect(self._move_down)
+        btn_row.addWidget(down_btn)
+        remove_btn = QPushButton("Remove")
+        remove_btn.clicked.connect(self._remove)
+        btn_row.addWidget(remove_btn)
+        right.addLayout(btn_row)
+
+        # Bottom buttons
+        bottom = QHBoxLayout()
+        bottom.addStretch()
+        build_btn = QPushButton("Build Document")
+        build_btn.setStyleSheet(
+            "QPushButton { background-color: #1A73E8; color: white; "
+            "font-weight: bold; padding: 6px 20px; border-radius: 4px; }"
+            "QPushButton:hover { background-color: #1557B0; }"
+        )
+        build_btn.clicked.connect(self._build)
+        bottom.addWidget(build_btn)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        bottom.addWidget(cancel_btn)
+        right.addLayout(bottom)
+        layout.addLayout(right)
+
+    def _add_snippet(self):
+        item = self.avail_list.currentItem()
+        if item:
+            self.order_list.addItem(item.text())
+
+    def _move_up(self):
+        row = self.order_list.currentRow()
+        if row > 0:
+            item = self.order_list.takeItem(row)
+            self.order_list.insertItem(row - 1, item)
+            self.order_list.setCurrentRow(row - 1)
+
+    def _move_down(self):
+        row = self.order_list.currentRow()
+        if row < self.order_list.count() - 1:
+            item = self.order_list.takeItem(row)
+            self.order_list.insertItem(row + 1, item)
+            self.order_list.setCurrentRow(row + 1)
+
+    def _remove(self):
+        row = self.order_list.currentRow()
+        if row >= 0:
+            self.order_list.takeItem(row)
+
+    def _build(self):
+        if self.order_list.count() == 0:
+            QMessageBox.information(self, "Build", "Add some snippets first.")
+            return
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Sheet"
+
+        current_row = 0
+        max_col = 0
+
+        for i in range(self.order_list.count()):
+            name = self.order_list.item(i).text()
+            path = SNIPPETS_DIR / f"{name}.xlsx"
+            if not path.exists():
+                continue
+
+            snip_wb = openpyxl.load_workbook(str(path))
+            snip_ws = snip_wb.active
+            snip_rows = snip_ws.max_row or 1
+            snip_cols = snip_ws.max_column or 1
+            max_col = max(max_col, snip_cols)
+
+            # Copy cells
+            for ri in range(snip_rows):
+                for ci in range(snip_cols):
+                    src = snip_ws.cell(row=ri + 1, column=ci + 1)
+                    dst = ws.cell(row=current_row + ri + 1, column=ci + 1)
+                    dst.value = src.value
+                    if src.font:
+                        dst.font = src.font.copy()
+                    if src.fill:
+                        dst.fill = src.fill.copy()
+                    if src.alignment:
+                        dst.alignment = src.alignment.copy()
+                    if src.border:
+                        dst.border = src.border.copy()
+
+            # Column widths (use widest from any snippet)
+            for ci in range(snip_cols):
+                col_letter = get_column_letter(ci + 1)
+                if col_letter in snip_ws.column_dimensions:
+                    src_w = snip_ws.column_dimensions[col_letter].width
+                    if src_w:
+                        existing = ws.column_dimensions[col_letter].width
+                        if not existing or src_w > existing:
+                            ws.column_dimensions[col_letter].width = src_w
+
+            # Row heights
+            for ri in range(snip_rows):
+                if (ri + 1) in snip_ws.row_dimensions:
+                    h = snip_ws.row_dimensions[ri + 1].height
+                    if h:
+                        ws.row_dimensions[current_row + ri + 1].height = h
+
+            # Merges
+            for rng in snip_ws.merged_cells.ranges:
+                ws.merge_cells(
+                    start_row=rng.min_row + current_row,
+                    start_column=rng.min_col,
+                    end_row=rng.max_row + current_row,
+                    end_column=rng.max_col,
+                )
+
+            current_row += snip_rows
+
+        self.result_wb = wb
+        self.accept()
+
+
 # ── Main Window ──────────────────────────────────────────────────────────────
 
 class SheetEditWindow(QMainWindow):
@@ -1287,6 +1849,7 @@ class SheetEditWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("SheetEdit")
         self.resize(1200, 800)
+        self.setAcceptDrops(True)
         self.wb = None
         self.filepath = None
         self.rules = []
@@ -1365,6 +1928,16 @@ class SheetEditWindow(QMainWindow):
         save_template_act = QAction("Save as Template...", self)
         save_template_act.triggered.connect(self._save_as_template)
         file_menu.addAction(save_template_act)
+
+        file_menu.addSeparator()
+
+        import_act = QAction("Import Call Sheet Data...", self)
+        import_act.triggered.connect(self._import_call_sheet)
+        file_menu.addAction(import_act)
+
+        compose_act = QAction("Build from Snippets...", self)
+        compose_act.triggered.connect(self._snippet_compose)
+        file_menu.addAction(compose_act)
 
         file_menu.addSeparator()
 
@@ -1612,6 +2185,55 @@ class SheetEditWindow(QMainWindow):
             self.statusBar().showMessage(f"Saved template: {name}")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save template:\n{e}")
+
+    def _import_call_sheet(self, files=None):
+        dlg = ImportCallSheetDialog(files, self)
+        if dlg.exec() == QDialog.Accepted and dlg.result_wb:
+            self.wb = dlg.result_wb
+            self.filepath = None
+            self._dirty = True
+            self.setWindowTitle("SheetEdit — Imported Call Sheet")
+            self._reload_tabs()
+            self.statusBar().showMessage(
+                f"Imported call sheet from {len(dlg.files)} file(s)"
+            )
+
+    def _snippet_compose(self):
+        dlg = SnippetComposer(self)
+        if dlg.exec() == QDialog.Accepted and dlg.result_wb:
+            self.wb = dlg.result_wb
+            self.filepath = None
+            self._dirty = True
+            self.setWindowTitle("SheetEdit — Composed Document")
+            self._reload_tabs()
+            self.statusBar().showMessage("Built document from snippets")
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                if Path(url.toLocalFile()).suffix.lower() in SUPPORTED_IMPORT_EXTS:
+                    event.acceptProposedAction()
+                    return
+
+    def dropEvent(self, event):
+        files = []
+        for url in event.mimeData().urls():
+            path = url.toLocalFile()
+            if path and Path(path).suffix.lower() in SUPPORTED_IMPORT_EXTS:
+                files.append(path)
+        if not files:
+            return
+        # If it's a single .xlsx, just open it normally
+        if len(files) == 1 and Path(files[0]).suffix.lower() == ".xlsx":
+            reply = QMessageBox.question(
+                self, "Open or Import?",
+                f"Open \"{Path(files[0]).name}\" as a spreadsheet, or import as call sheet data?",
+                QMessageBox.Open | QMessageBox.Apply,
+            )
+            if reply == QMessageBox.Open:
+                self.open_file(files[0])
+                return
+        self._import_call_sheet(files)
 
     def _open_dialog(self):
         path, _ = QFileDialog.getOpenFileName(
