@@ -709,10 +709,29 @@ class SheetView(QTableWidget):
             return
         # For single cell edits, we push a minimal undo entry
         # (This captures typing; bulk operations push their own undo before changing)
-        # Check rules on the changed cell
+        # Update formula bar and check rules
         win = self.window()
+        if hasattr(win, '_update_formula_bar'):
+            win._update_formula_bar()
         if hasattr(win, '_check_and_warn'):
             win._check_and_warn([(item.row(), item.column())])
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
+            items = self.selectedItems()
+            if items:
+                coords = [(item.row(), item.column()) for item in items]
+                self.push_undo(coords)
+                self._tracking_edits = False
+                for item in items:
+                    item.setText("")
+                self._tracking_edits = True
+                # Update formula bar
+                win = self.window()
+                if hasattr(win, '_update_formula_bar'):
+                    win._update_formula_bar()
+            return
+        super().keyPressEvent(event)
 
     def contextMenuEvent(self, event):
         menu = QMenu(self)
@@ -793,10 +812,14 @@ class SheetView(QTableWidget):
         layout.addWidget(close_btn)
         dlg.exec()
 
+    # Default grid size (matches Google Sheets)
+    DEFAULT_ROWS = 1000
+    DEFAULT_COLS = 26
+
     def _load(self):
         ws = self.ws
-        rows = ws.max_row or 1
-        cols = ws.max_column or 1
+        rows = max(ws.max_row or 1, self.DEFAULT_ROWS)
+        cols = max(ws.max_column or 1, self.DEFAULT_COLS)
         self.setRowCount(rows)
         self.setColumnCount(cols)
 
@@ -1140,8 +1163,31 @@ class SheetEditWindow(QMainWindow):
         self.filepath = None
         self.rules = []
 
+        # Formula bar
+        self._cell_label = QLabel("A1")
+        self._cell_label.setObjectName("formula_label")
+        self._cell_label.setFixedWidth(60)
+        self._cell_label.setAlignment(Qt.AlignCenter)
+        self._formula_edit = QLineEdit()
+        self._formula_edit.setObjectName("formula_edit")
+        self._formula_edit.setPlaceholderText("Cell contents")
+        self._formula_edit.returnPressed.connect(self._formula_bar_commit)
+
+        formula_bar = QHBoxLayout()
+        formula_bar.setContentsMargins(6, 2, 6, 2)
+        formula_bar.addWidget(self._cell_label)
+        formula_bar.addWidget(self._formula_edit)
+
         self.tabs = QTabWidget()
-        self.setCentralWidget(self.tabs)
+        self.tabs.currentChanged.connect(self._tab_changed)
+
+        central = QWidget()
+        vbox = QVBoxLayout(central)
+        vbox.setContentsMargins(0, 0, 0, 0)
+        vbox.setSpacing(0)
+        vbox.addLayout(formula_bar)
+        vbox.addWidget(self.tabs)
+        self.setCentralWidget(central)
 
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage("Ready")
@@ -1470,7 +1516,47 @@ class SheetEditWindow(QMainWindow):
         self.tabs.clear()
         for name in self.wb.sheetnames:
             sv = SheetView(self.wb[name], self)
+            sv.currentCellChanged.connect(self._on_cell_changed)
             self.tabs.addTab(sv, name)
+
+    def _tab_changed(self, index):
+        self._update_formula_bar()
+
+    def _on_cell_changed(self, row, col, prev_row, prev_col):
+        self._update_formula_bar()
+
+    def _update_formula_bar(self):
+        sv = self._sheet()
+        if sv is None:
+            self._cell_label.setText("")
+            self._formula_edit.setText("")
+            return
+        row = sv.currentRow()
+        col = sv.currentColumn()
+        if row < 0 or col < 0:
+            self._cell_label.setText("")
+            self._formula_edit.setText("")
+            return
+        ref = f"{get_column_letter(col + 1)}{row + 1}"
+        self._cell_label.setText(ref)
+        item = sv.item(row, col)
+        if item:
+            self._formula_edit.setText(item.text())
+        else:
+            self._formula_edit.setText("")
+
+    def _formula_bar_commit(self):
+        sv = self._sheet()
+        if sv is None:
+            return
+        row = sv.currentRow()
+        col = sv.currentColumn()
+        item = sv.item(row, col)
+        if item is None:
+            item = QTableWidgetItem()
+            sv.setItem(row, col, item)
+        sv.push_undo([(row, col)])
+        item.setText(self._formula_edit.text())
 
     def _save(self):
         if self.filepath:
@@ -2265,6 +2351,28 @@ QScrollBar::handle:horizontal:hover {
 }
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
     width: 0;
+}
+#formula_label {
+    background-color: #F1F3F4;
+    border: 1px solid #DADCE0;
+    border-radius: 3px;
+    padding: 2px 6px;
+    font-family: Arial;
+    font-size: 12px;
+    font-weight: bold;
+    color: #5F6368;
+}
+#formula_edit {
+    background-color: #FFFFFF;
+    border: 1px solid #DADCE0;
+    border-radius: 3px;
+    padding: 2px 6px;
+    font-family: Arial;
+    font-size: 13px;
+    color: #202124;
+}
+#formula_edit:focus {
+    border: 2px solid #1A73E8;
 }
 """
 
