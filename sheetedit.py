@@ -3,13 +3,15 @@
 
 import sys
 import os
+import shutil
 from pathlib import Path
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTableWidget, QTableWidgetItem, QTabWidget,
     QToolBar, QFileDialog, QColorDialog, QMessageBox, QVBoxLayout, QWidget,
     QLabel, QStatusBar, QMenu, QMenuBar, QSizePolicy, QStyledItemDelegate,
-    QStyleOptionViewItem,
+    QStyleOptionViewItem, QDialog, QHBoxLayout, QListWidget, QListWidgetItem,
+    QPushButton, QLineEdit, QInputDialog, QGridLayout, QFrame,
 )
 from PySide6.QtPrintSupport import QPrinter, QPrintDialog, QPrintPreviewDialog
 from PySide6.QtGui import QPageLayout
@@ -113,6 +115,132 @@ def qcolor_to_xl_rgb(qc: QColor) -> str:
 
 HALIGN_MAP = {"left": Qt.AlignLeft, "center": Qt.AlignHCenter, "right": Qt.AlignRight}
 VALIGN_MAP = {"top": Qt.AlignTop, "center": Qt.AlignVCenter, "bottom": Qt.AlignBottom}
+
+
+# ── Templates ────────────────────────────────────────────────────────────────
+
+TEMPLATES_DIR = Path.home() / ".sheetedit" / "templates"
+
+
+def _ensure_templates_dir():
+    TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _builtin_templates():
+    """Return dict of {name: builder_function} for built-in templates."""
+    templates = {}
+
+    def _budget():
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Budget"
+        headers = ["Category", "Budgeted", "Actual", "Difference"]
+        for c, h in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=c, value=h)
+            cell.font = XlFont(bold=True, size=11)
+            cell.fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+            cell.font = XlFont(bold=True, size=11, color="FFFFFF")
+            cell.alignment = Alignment(horizontal="center")
+        categories = ["Housing", "Food", "Transport", "Utilities", "Entertainment", "Savings", "Other"]
+        for r, cat in enumerate(categories, 2):
+            ws.cell(row=r, column=1, value=cat)
+            ws.cell(row=r, column=2, value=0)
+            ws.cell(row=r, column=3, value=0)
+            ws.cell(row=r, column=4).value = f"=B{r}-C{r}"
+        total_row = len(categories) + 2
+        ws.cell(row=total_row, column=1, value="Total").font = XlFont(bold=True)
+        for c in range(2, 5):
+            col_letter = get_column_letter(c)
+            ws.cell(row=total_row, column=c).value = f"=SUM({col_letter}2:{col_letter}{total_row-1})"
+            ws.cell(row=total_row, column=c).font = XlFont(bold=True)
+        ws.column_dimensions["A"].width = 18
+        for col in ["B", "C", "D"]:
+            ws.column_dimensions[col].width = 14
+        return wb
+
+    def _invoice():
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Invoice"
+        ws.merge_cells("A1:D1")
+        ws.cell(row=1, column=1, value="INVOICE").font = XlFont(bold=True, size=20)
+        ws.cell(row=1, column=1).alignment = Alignment(horizontal="center")
+        labels = [("Invoice #:", ""), ("Date:", ""), ("Bill To:", ""), ("", "")]
+        for r, (label, val) in enumerate(labels, 3):
+            ws.cell(row=r, column=1, value=label).font = XlFont(bold=True)
+            ws.cell(row=r, column=2, value=val)
+        header_row = 8
+        headers = ["Description", "Qty", "Unit Price", "Amount"]
+        for c, h in enumerate(headers, 1):
+            cell = ws.cell(row=header_row, column=c, value=h)
+            cell.font = XlFont(bold=True, color="FFFFFF")
+            cell.fill = PatternFill(start_color="44546A", end_color="44546A", fill_type="solid")
+            cell.alignment = Alignment(horizontal="center")
+        for r in range(9, 14):
+            ws.cell(row=r, column=4).value = f"=B{r}*C{r}"
+        ws.cell(row=15, column=3, value="Total:").font = XlFont(bold=True)
+        ws.cell(row=15, column=4).value = "=SUM(D9:D13)"
+        ws.cell(row=15, column=4).font = XlFont(bold=True)
+        ws.column_dimensions["A"].width = 30
+        for col in ["B", "C", "D"]:
+            ws.column_dimensions[col].width = 14
+        return wb
+
+    def _call_sheet():
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Call Sheet"
+        ws.merge_cells("A1:F1")
+        ws.cell(row=1, column=1, value="CALL SHEET").font = XlFont(bold=True, size=18)
+        ws.cell(row=1, column=1).alignment = Alignment(horizontal="center")
+        info = ["Production:", "Date:", "Location:", "Call Time:"]
+        for r, label in enumerate(info, 3):
+            ws.cell(row=r, column=1, value=label).font = XlFont(bold=True)
+        header_row = 8
+        headers = ["Name", "Role", "Call Time", "Wrap Time", "Phone", "Notes"]
+        for c, h in enumerate(headers, 1):
+            cell = ws.cell(row=header_row, column=c, value=h)
+            cell.font = XlFont(bold=True, color="FFFFFF")
+            cell.fill = PatternFill(start_color="ED7D31", end_color="ED7D31", fill_type="solid")
+            cell.alignment = Alignment(horizontal="center")
+        for col in ["A", "B"]:
+            ws.column_dimensions[col].width = 20
+        for col in ["C", "D"]:
+            ws.column_dimensions[col].width = 12
+        ws.column_dimensions["E"].width = 16
+        ws.column_dimensions["F"].width = 24
+        return wb
+
+    def _weekly_schedule():
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Schedule"
+        ws.cell(row=1, column=1, value="Time")
+        days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+        for c, day in enumerate(days, 2):
+            cell = ws.cell(row=1, column=c, value=day)
+            cell.font = XlFont(bold=True, color="FFFFFF")
+            cell.fill = PatternFill(start_color="5B9BD5", end_color="5B9BD5", fill_type="solid")
+            cell.alignment = Alignment(horizontal="center")
+        ws.cell(row=1, column=1).font = XlFont(bold=True, color="FFFFFF")
+        ws.cell(row=1, column=1).fill = PatternFill(start_color="5B9BD5", end_color="5B9BD5", fill_type="solid")
+        ws.cell(row=1, column=1).alignment = Alignment(horizontal="center")
+        times = [f"{h}:00 {'AM' if h < 12 else 'PM'}" for h in range(7, 22)]
+        for r, t in enumerate(times, 2):
+            ws.cell(row=r, column=1, value=t).font = XlFont(size=10)
+        ws.column_dimensions["A"].width = 12
+        for c in range(2, 9):
+            ws.column_dimensions[get_column_letter(c)].width = 16
+        return wb
+
+    templates["Budget"] = _budget
+    templates["Invoice"] = _invoice
+    templates["Call Sheet"] = _call_sheet
+    templates["Weekly Schedule"] = _weekly_schedule
+    return templates
+
+
+BUILTIN_TEMPLATES = _builtin_templates()
 
 
 # ── Column/Row Size Conversion ───────────────────────────────────────────────
@@ -437,6 +565,112 @@ class SheetView(QTableWidget):
             )
 
 
+# ── Template Picker Dialog ───────────────────────────────────────────────────
+
+class TemplatePicker(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("New from Template")
+        self.setMinimumSize(500, 400)
+        self.chosen_wb = None
+
+        layout = QVBoxLayout(self)
+
+        # Section: Built-in Templates
+        layout.addWidget(QLabel("Built-in Templates"))
+        self.builtin_list = QListWidget()
+        for name in BUILTIN_TEMPLATES:
+            self.builtin_list.addItem(name)
+        self.builtin_list.itemDoubleClicked.connect(self._use_builtin)
+        layout.addWidget(self.builtin_list)
+
+        # Section: User Templates
+        _ensure_templates_dir()
+        user_templates = sorted(TEMPLATES_DIR.glob("*.xlsx"))
+        if user_templates:
+            sep = QFrame()
+            sep.setFrameShape(QFrame.HLine)
+            layout.addWidget(sep)
+            layout.addWidget(QLabel("My Templates"))
+            self.user_list = QListWidget()
+            for p in user_templates:
+                item = QListWidgetItem(p.stem)
+                item.setData(Qt.UserRole, str(p))
+                self.user_list.addItem(item)
+            self.user_list.itemDoubleClicked.connect(self._use_user)
+            layout.addWidget(self.user_list)
+
+            del_btn = QPushButton("Delete Selected Template")
+            del_btn.clicked.connect(self._delete_user_template)
+            layout.addWidget(del_btn)
+        else:
+            self.user_list = None
+
+        # Buttons
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        use_btn = QPushButton("Use Template")
+        use_btn.setDefault(True)
+        use_btn.clicked.connect(self._use_selected)
+        btn_layout.addWidget(use_btn)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(cancel_btn)
+        layout.addLayout(btn_layout)
+
+    def _use_selected(self):
+        # Check builtin first, then user
+        item = self.builtin_list.currentItem()
+        if item and self.builtin_list.hasFocus():
+            self._use_builtin(item)
+            return
+        if self.user_list:
+            item = self.user_list.currentItem()
+            if item:
+                self._use_user(item)
+                return
+        # Fallback: use whatever is selected in builtin
+        item = self.builtin_list.currentItem()
+        if item:
+            self._use_builtin(item)
+
+    def _use_builtin(self, item):
+        name = item.text()
+        builder = BUILTIN_TEMPLATES.get(name)
+        if builder:
+            self.chosen_wb = builder()
+            self.accept()
+
+    def _use_user(self, item):
+        path = item.data(Qt.UserRole)
+        if path and Path(path).exists():
+            try:
+                self.chosen_wb = openpyxl.load_workbook(path)
+                self.accept()
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to load template:\n{e}")
+
+    def _delete_user_template(self):
+        if not self.user_list:
+            return
+        item = self.user_list.currentItem()
+        if not item:
+            return
+        path = item.data(Qt.UserRole)
+        name = item.text()
+        reply = QMessageBox.question(
+            self, "Delete Template",
+            f"Delete template \"{name}\"?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            try:
+                Path(path).unlink()
+                self.user_list.takeItem(self.user_list.row(item))
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to delete:\n{e}")
+
+
 # ── Main Window ──────────────────────────────────────────────────────────────
 
 class SheetEditWindow(QMainWindow):
@@ -473,6 +707,12 @@ class SheetEditWindow(QMainWindow):
         new_act.triggered.connect(self._new_workbook)
         file_menu.addAction(new_act)
 
+        template_act = QAction("New from Template...", self)
+        template_act.triggered.connect(self._new_from_template)
+        file_menu.addAction(template_act)
+
+        file_menu.addSeparator()
+
         open_act = QAction("Open...", self)
         open_act.setShortcut(QKeySequence.Open)
         open_act.triggered.connect(self._open_dialog)
@@ -487,6 +727,10 @@ class SheetEditWindow(QMainWindow):
         saveas_act.setShortcut(QKeySequence("Ctrl+Shift+S"))
         saveas_act.triggered.connect(self._save_as)
         file_menu.addAction(saveas_act)
+
+        save_template_act = QAction("Save as Template...", self)
+        save_template_act.triggered.connect(self._save_as_template)
+        file_menu.addAction(save_template_act)
 
         file_menu.addSeparator()
 
@@ -636,6 +880,40 @@ class SheetEditWindow(QMainWindow):
         self.filepath = None
         self.setWindowTitle("SheetEdit — New Workbook")
         self._reload_tabs()
+
+    def _new_from_template(self):
+        dlg = TemplatePicker(self)
+        if dlg.exec() == QDialog.Accepted and dlg.chosen_wb:
+            self.wb = dlg.chosen_wb
+            self.filepath = None
+            self.setWindowTitle("SheetEdit — New from Template")
+            self._reload_tabs()
+            self.statusBar().showMessage("Created from template")
+
+    def _save_as_template(self):
+        if not self.wb:
+            return
+        _ensure_templates_dir()
+        name, ok = QInputDialog.getText(self, "Save as Template", "Template name:")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        dest = TEMPLATES_DIR / f"{name}.xlsx"
+        if dest.exists():
+            reply = QMessageBox.question(
+                self, "Overwrite Template",
+                f"Template \"{name}\" already exists. Overwrite?",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+        try:
+            for i in range(self.tabs.count()):
+                self.tabs.widget(i).sync_to_ws()
+            self.wb.save(str(dest))
+            self.statusBar().showMessage(f"Saved template: {name}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to save template:\n{e}")
 
     def _open_dialog(self):
         path, _ = QFileDialog.getOpenFileName(
