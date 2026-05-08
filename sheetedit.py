@@ -689,12 +689,16 @@ class SheetEditWindow(QMainWindow):
 
     # ── Print ────────────────────────────────────────────────────────────
 
+    def _auto_orientation(self, sv):
+        """Always use landscape for spreadsheets — they're almost always wider."""
+        return QPageLayout.Landscape
+
     def _print_preview(self):
         sv = self._sheet()
         if sv is None:
             return
-        printer = QPrinter(QPrinter.HighResolution)
-        printer.setPageOrientation(QPageLayout.Landscape)
+        printer = QPrinter(QPrinter.ScreenResolution)
+        printer.setPageOrientation(self._auto_orientation(sv))
         dialog = QPrintPreviewDialog(printer, self)
         dialog.paintRequested.connect(lambda p: self._render_sheet(p, sv))
         dialog.exec()
@@ -703,64 +707,140 @@ class SheetEditWindow(QMainWindow):
         sv = self._sheet()
         if sv is None:
             return
-        printer = QPrinter(QPrinter.HighResolution)
-        printer.setPageOrientation(QPageLayout.Landscape)
+        printer = QPrinter(QPrinter.ScreenResolution)
+        printer.setPageOrientation(self._auto_orientation(sv))
         dialog = QPrintDialog(printer, self)
         if dialog.exec() == QPrintDialog.Accepted:
             self._render_sheet(printer, sv)
 
     def _render_sheet(self, printer, sv: "SheetView"):
-        """Render the current sheet onto a QPrinter with pagination."""
+        """Render the sheet: fit width to page, paginate rows across pages."""
         painter = QPainter()
         if not painter.begin(printer):
             return
 
-        page_rect = printer.pageRect(QPrinter.DevicePixel)
-        pw = page_rect.width()
-        ph = page_rect.height()
+        # Use painter coordinate space (matches what drawRect/drawText use)
+        pw = float(painter.device().width())
+        ph = float(painter.device().height())
 
-        # Gather column widths and row heights in screen pixels
-        col_widths = [sv.columnWidth(c) for c in range(sv.columnCount())]
-        row_heights = [sv.rowHeight(r) for r in range(sv.rowCount())]
+        # Find used range
+        max_row = sv.rowCount()
+        max_col = sv.columnCount()
 
-        # Scale: fit all columns to page width
-        total_col_w = sum(col_widths)
-        if total_col_w <= 0:
+        def _cell_has_content(item):
+            if item is None:
+                return False
+            if item.text():
+                return True
+            bg = item.background()
+            if bg != QBrush() and bg.color().isValid() and bg.color() != QColor("#FFFFFF"):
+                return True
+            if item.data(BORDER_ROLE):
+                return True
+            return False
+
+        # Trim trailing empty rows
+        for ri in range(max_row - 1, -1, -1):
+            for ci in range(max_col):
+                if _cell_has_content(sv.item(ri, ci)):
+                    max_row = ri + 1
+                    break
+            else:
+                continue
+            break
+        else:
+            max_row = 1
+
+        # Trim trailing empty columns
+        for ci in range(max_col - 1, -1, -1):
+            for ri in range(max_row):
+                if _cell_has_content(sv.item(ri, ci)):
+                    max_col = ci + 1
+                    break
+            else:
+                continue
+            break
+        else:
+            max_col = 1
+
+        col_widths = [sv.columnWidth(c) for c in range(max_col)]
+        row_heights = [sv.rowHeight(r) for r in range(max_row)]
+
+        total_w = sum(col_widths)
+        if total_w <= 0:
             painter.end()
             return
-        scale = pw / total_col_w
-        # Cap scale so rows aren't absurdly large
-        max_scale = ph / 40  # at least 40px row equivalent per page
-        if scale > max_scale:
-            scale = max_scale
 
-        scaled_col_widths = [w * scale for w in col_widths]
-        scaled_row_heights = [h * scale for h in row_heights]
+        # Fit WIDTH to page — scale everything proportionally
+        scale = pw / total_w
 
-        # Paginate rows
-        pages = []  # list of (start_row, end_row)
-        current_y = 0
+        # Paginate: figure out which rows fit on each page
+        pages = []
         page_start = 0
-        for ri, rh in enumerate(scaled_row_heights):
-            if current_y + rh > ph and ri > page_start:
+        page_y = 0.0
+        page_h = ph / scale  # page height in screen-pixel units
+
+        for ri in range(max_row):
+            rh = row_heights[ri]
+            if page_y + rh > page_h and ri > page_start:
                 pages.append((page_start, ri - 1))
                 page_start = ri
-                current_y = rh
+                page_y = rh
             else:
-                current_y += rh
-        pages.append((page_start, len(scaled_row_heights) - 1))
+                page_y += rh
+        pages.append((page_start, max_row - 1))
+
+        # Build merge lookup: (row, col) -> (r1, c1, r2, c2) for the top-left cell
+        # Also track which cells are "hidden" (inside a merge but not the origin)
+        merge_origins = {}  # (r1, c1) -> (r1, c1, r2, c2)
+        merged_hidden = set()  # cells that are covered by a merge
+        for m in sv.merges:
+            r1, c1, r2, c2 = m
+            merge_origins[(r1, c1)] = m
+            for mr in range(r1, r2 + 1):
+                for mc in range(c1, c2 + 1):
+                    if (mr, mc) != (r1, c1):
+                        merged_hidden.add((mr, mc))
+
+        # Precompute cumulative column x positions
+        col_x = [0.0]
+        for cw in col_widths:
+            col_x.append(col_x[-1] + cw)
 
         for page_idx, (row_start, row_end) in enumerate(pages):
             if page_idx > 0:
                 printer.newPage()
 
-            y = 0.0
-            for ri in range(row_start, row_end + 1):
-                x = 0.0
-                rh = scaled_row_heights[ri]
+            painter.save()
+            painter.scale(scale, scale)
 
-                for ci in range(sv.columnCount()):
-                    cw = scaled_col_widths[ci]
+            # Precompute row y positions relative to page
+            row_y = [0.0]
+            for ri in range(row_start, row_end + 1):
+                row_y.append(row_y[-1] + row_heights[ri])
+
+            # First pass: draw grid lines and fills for all cells
+            for ri_idx, ri in enumerate(range(row_start, row_end + 1)):
+                for ci in range(max_col):
+                    if (ri, ci) in merged_hidden:
+                        continue
+
+                    x = col_x[ci]
+                    y = row_y[ri_idx]
+
+                    # Check if this is a merge origin
+                    if (ri, ci) in merge_origins:
+                        mr1, mc1, mr2, mc2 = merge_origins[(ri, ci)]
+                        cw = col_x[min(mc2 + 1, max_col)] - col_x[mc1]
+                        # Row height for merge: sum heights of spanned rows on this page
+                        rh = 0.0
+                        for mr in range(mr1, mr2 + 1):
+                            if row_start <= mr <= row_end:
+                                rh += row_heights[mr]
+                    else:
+                        cw = col_widths[ci]
+                        rh = row_heights[ri]
+
                     cell_rect = QRectF(x, y, cw, rh)
 
                     item = sv.item(ri, ci)
@@ -781,16 +861,18 @@ class SheetEditWindow(QMainWindow):
                             ]:
                                 info = bd.get(side_name)
                                 if info:
-                                    color_hex, width, style = info
-                                    pen = QPen(QColor(color_hex), width * scale * 0.5, style)
+                                    color_hex, bw, style = info
+                                    pen = QPen(QColor(color_hex), max(bw, 1), style)
                                     painter.setPen(pen)
-                                    painter.drawLine(QPointF(coords[0], coords[1]), QPointF(coords[2], coords[3]))
+                                    painter.drawLine(
+                                        QPointF(coords[0], coords[1]),
+                                        QPointF(coords[2], coords[3]),
+                                    )
 
                         # Text
                         text = item.text()
                         if text:
                             qf = QFont(item.font())
-                            qf.setPointSizeF(qf.pointSizeF() * scale / printer.logicalDpiY() * 72.0)
                             painter.setFont(qf)
 
                             fg = item.foreground()
@@ -800,15 +882,14 @@ class SheetEditWindow(QMainWindow):
                                 painter.setPen(QPen(QColor("#202124")))
 
                             flags = item.textAlignment()
-                            text_rect = cell_rect.adjusted(3 * scale, 1 * scale, -3 * scale, -1 * scale)
+                            text_rect = cell_rect.adjusted(3, 1, -3, -1)
                             painter.drawText(text_rect, flags, text)
 
                     # Grid line
-                    painter.setPen(QPen(QColor("#E2E2E2"), 0.5))
+                    painter.setPen(QPen(QColor("#D0D0D0"), 0.5))
                     painter.drawRect(cell_rect)
 
-                    x += cw
-                y += rh
+            painter.restore()
 
         painter.end()
 
