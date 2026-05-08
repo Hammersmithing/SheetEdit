@@ -328,12 +328,21 @@ class BorderDelegate(QStyledItemDelegate):
         # Draw default content first
         super().paint(painter, option, index)
 
+        # Only check custom roles if the cell has data
+        try:
+            border_data = index.data(BORDER_ROLE)
+            rule_data = index.data(RULE_ROLE)
+        except Exception:
+            return
+
+        if not border_data and not rule_data:
+            return
+
         painter.save()
         rect = option.rect
 
         # Draw borders
-        border_data = index.data(BORDER_ROLE)
-        if border_data:
+        if border_data and isinstance(border_data, dict):
             for side_name, edge in [
                 ("top", (rect.left(), rect.top(), rect.right(), rect.top())),
                 ("bottom", (rect.left(), rect.bottom(), rect.right(), rect.bottom())),
@@ -348,7 +357,7 @@ class BorderDelegate(QStyledItemDelegate):
                     painter.drawLine(*edge)
 
         # Draw blue dot for ruled cells
-        if index.data(RULE_ROLE):
+        if rule_data:
             painter.setBrush(QBrush(QColor("#1A73E8")))
             painter.setPen(Qt.NoPen)
             painter.drawEllipse(rect.right() - 7, rect.top() + 2, 5, 5)
