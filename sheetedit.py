@@ -2580,8 +2580,8 @@ class SheetEditWindow(QMainWindow):
     # ── Print ────────────────────────────────────────────────────────────
 
     def _auto_orientation(self, sv):
-        """Always use landscape for spreadsheets — they're almost always wider."""
-        return QPageLayout.Landscape
+        """Default to portrait orientation."""
+        return QPageLayout.Portrait
 
     def _print_preview(self):
         from PySide6.QtPrintSupport import QPrintPreviewWidget
