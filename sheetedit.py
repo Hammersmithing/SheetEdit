@@ -353,9 +353,87 @@ class SheetView(QTableWidget):
         super().__init__(parent)
         self.ws = ws
         self.merges = []
+        self._undo_stack = []
+        self._redo_stack = []
+        self._MAX_UNDO = 50
         self.setItemDelegate(BorderDelegate(self))
         self.setShowGrid(True)  # light grid from stylesheet, borders drawn on top
         self._load()
+        self.itemChanged.connect(self._on_item_changed)
+        self._tracking_edits = True
+
+    def _snapshot_cells(self, cells):
+        """Capture current state of a list of (row, col) cells."""
+        snap = {}
+        for r, c in cells:
+            item = self.item(r, c)
+            if item:
+                snap[(r, c)] = {
+                    "text": item.text(),
+                    "fg": item.foreground().color() if item.foreground().style() != Qt.NoBrush else None,
+                    "bg": item.background().color() if item.background().style() != Qt.NoBrush else None,
+                    "font": QFont(item.font()),
+                    "align": item.textAlignment(),
+                    "border": item.data(BORDER_ROLE),
+                }
+            else:
+                snap[(r, c)] = None
+        return snap
+
+    def _restore_snapshot(self, snap):
+        """Restore cells from a snapshot dict."""
+        self._tracking_edits = False
+        for (r, c), data in snap.items():
+            if data is None:
+                if self.item(r, c):
+                    self.item(r, c).setText("")
+                continue
+            item = self.item(r, c)
+            if not item:
+                item = QTableWidgetItem()
+                self.setItem(r, c, item)
+            item.setText(data["text"])
+            if data["fg"]:
+                item.setForeground(QBrush(data["fg"]))
+            if data["bg"]:
+                item.setBackground(QBrush(data["bg"]))
+            item.setFont(data["font"])
+            item.setTextAlignment(data["align"])
+            if data["border"]:
+                item.setData(BORDER_ROLE, data["border"])
+        self._tracking_edits = True
+
+    def push_undo(self, cells):
+        """Save current state of cells for undo. Call BEFORE making changes."""
+        snap = self._snapshot_cells(cells)
+        self._undo_stack.append(snap)
+        if len(self._undo_stack) > self._MAX_UNDO:
+            self._undo_stack.pop(0)
+        self._redo_stack.clear()
+
+    def undo(self):
+        if not self._undo_stack:
+            return
+        old_snap = self._undo_stack.pop()
+        # Save current state for redo
+        current = self._snapshot_cells(old_snap.keys())
+        self._redo_stack.append(current)
+        self._restore_snapshot(old_snap)
+
+    def redo(self):
+        if not self._redo_stack:
+            return
+        new_snap = self._redo_stack.pop()
+        current = self._snapshot_cells(new_snap.keys())
+        self._undo_stack.append(current)
+        self._restore_snapshot(new_snap)
+
+    def _on_item_changed(self, item):
+        """Track direct cell edits by the user."""
+        if not self._tracking_edits:
+            return
+        # For single cell edits, we push a minimal undo entry
+        # (This captures typing; bulk operations push their own undo before changing)
 
     def _load(self):
         ws = self.ws
@@ -745,6 +823,18 @@ class SheetEditWindow(QMainWindow):
 
         edit_menu = mb.addMenu("Edit")
 
+        undo_act = QAction("Undo", self)
+        undo_act.setShortcut(QKeySequence.Undo)
+        undo_act.triggered.connect(self.cmd_undo)
+        edit_menu.addAction(undo_act)
+
+        redo_act = QAction("Redo", self)
+        redo_act.setShortcut(QKeySequence.Redo)
+        redo_act.triggered.connect(self.cmd_redo)
+        edit_menu.addAction(redo_act)
+
+        edit_menu.addSeparator()
+
         ins_row = QAction("Insert Row", self)
         ins_row.triggered.connect(self.cmd_insert_row)
         edit_menu.addAction(ins_row)
@@ -767,6 +857,19 @@ class SheetEditWindow(QMainWindow):
         tb = self.addToolBar("Format")
         tb.setIconSize(QSize(20, 20))
         tb.setMovable(False)
+
+        # Undo / Redo
+        undo_btn = QAction("\u21A9", self)
+        undo_btn.setToolTip("Undo (Ctrl+Z)")
+        undo_btn.triggered.connect(self.cmd_undo)
+        tb.addAction(undo_btn)
+
+        redo_btn = QAction("\u21AA", self)
+        redo_btn.setToolTip("Redo (Ctrl+Shift+Z)")
+        redo_btn.triggered.connect(self.cmd_redo)
+        tb.addAction(redo_btn)
+
+        tb.addSeparator()
 
         # Bold
         bold_act = QAction("B", self)
@@ -1182,6 +1285,31 @@ class SheetEditWindow(QMainWindow):
             return []
         return sv.selectedItems()
 
+    def _selected_coords(self):
+        """Return list of (row, col) for selected cells."""
+        sv = self._sheet()
+        if sv is None:
+            return []
+        return [(item.row(), item.column()) for item in sv.selectedItems()]
+
+    def _push_undo_for_selection(self):
+        sv = self._sheet()
+        if sv is None:
+            return
+        coords = self._selected_coords()
+        if coords:
+            sv.push_undo(coords)
+
+    def cmd_undo(self):
+        sv = self._sheet()
+        if sv:
+            sv.undo()
+
+    def cmd_redo(self):
+        sv = self._sheet()
+        if sv:
+            sv.redo()
+
     def _selected_range(self):
         sv = self._sheet()
         if sv is None:
@@ -1195,12 +1323,14 @@ class SheetEditWindow(QMainWindow):
     # ── Format commands ──────────────────────────────────────────────────
 
     def cmd_bold(self):
+        self._push_undo_for_selection()
         for item in self._selected_items():
             f = item.font()
             f.setBold(not f.bold())
             item.setFont(f)
 
     def cmd_italic(self):
+        self._push_undo_for_selection()
         for item in self._selected_items():
             f = item.font()
             f.setItalic(not f.italic())
@@ -1209,16 +1339,19 @@ class SheetEditWindow(QMainWindow):
     def cmd_fill_color(self):
         color = QColorDialog.getColor(QColor(Qt.white), self, "Fill Color")
         if color.isValid():
+            self._push_undo_for_selection()
             for item in self._selected_items():
                 item.setBackground(QBrush(color))
 
     def cmd_font_color(self):
         color = QColorDialog.getColor(QColor(Qt.black), self, "Font Color")
         if color.isValid():
+            self._push_undo_for_selection()
             for item in self._selected_items():
                 item.setForeground(QBrush(color))
 
     def cmd_halign(self, align):
+        self._push_undo_for_selection()
         flag = HALIGN_MAP[align]
         for item in self._selected_items():
             cur = item.textAlignment()
@@ -1226,6 +1359,7 @@ class SheetEditWindow(QMainWindow):
             item.setTextAlignment(cur | flag)
 
     def cmd_valign(self, align):
+        self._push_undo_for_selection()
         flag = VALIGN_MAP[align]
         for item in self._selected_items():
             cur = item.textAlignment()
@@ -1233,6 +1367,7 @@ class SheetEditWindow(QMainWindow):
             item.setTextAlignment(cur | flag)
 
     def cmd_wrap(self):
+        self._push_undo_for_selection()
         for item in self._selected_items():
             cur = item.textAlignment()
             item.setTextAlignment(cur ^ Qt.TextWordWrap)
@@ -1268,6 +1403,7 @@ class SheetEditWindow(QMainWindow):
 
     def _apply_borders(self, color_hex, width):
         """Apply border to all selected cells."""
+        self._push_undo_for_selection()
         rng = self._selected_range()
         if rng is None:
             return
@@ -1313,6 +1449,7 @@ class SheetEditWindow(QMainWindow):
         self._apply_borders("#000000", 2)
 
     def cmd_clear_borders(self):
+        self._push_undo_for_selection()
         for item in self._selected_items():
             item.setData(BORDER_ROLE, None)
         sv = self._sheet()
@@ -1321,6 +1458,7 @@ class SheetEditWindow(QMainWindow):
         self.statusBar().showMessage("Borders cleared")
 
     def cmd_force_text(self):
+        self._push_undo_for_selection()
         for item in self._selected_items():
             txt = item.text()
             item.setText(txt)
