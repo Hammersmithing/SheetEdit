@@ -690,6 +690,9 @@ class SheetView(QTableWidget):
         if len(self._undo_stack) > self._MAX_UNDO:
             self._undo_stack.pop(0)
         self._redo_stack.clear()
+        win = self.window()
+        if hasattr(win, '_dirty'):
+            win._dirty = True
 
     def undo(self):
         if not self._undo_stack:
@@ -717,8 +720,10 @@ class SheetView(QTableWidget):
             return
         # For single cell edits, we push a minimal undo entry
         # (This captures typing; bulk operations push their own undo before changing)
-        # Update formula bar and check rules
+        # Mark dirty, update formula bar and check rules
         win = self.window()
+        if hasattr(win, '_dirty'):
+            win._dirty = True
         if hasattr(win, '_update_formula_bar'):
             win._update_formula_bar()
         if hasattr(win, '_check_and_warn'):
@@ -1276,6 +1281,7 @@ class SheetEditWindow(QMainWindow):
         self.wb = None
         self.filepath = None
         self.rules = []
+        self._dirty = False
 
         # Formula bar
         self._cell_label = QLabel("A1")
@@ -1548,6 +1554,7 @@ class SheetEditWindow(QMainWindow):
         self.wb = openpyxl.Workbook()
         self.filepath = None
         self.rules = []
+        self._dirty = False
         self.setWindowTitle("SheetEdit — New Workbook")
         self._reload_tabs()
 
@@ -1701,10 +1708,28 @@ class SheetEditWindow(QMainWindow):
                     rp.write_text(json.dumps(self.rules, indent=2))
                 elif rp.exists():
                     rp.unlink()
+            self._dirty = False
             self.setWindowTitle(f"SheetEdit \u2014 {Path(path).name}")
             self.statusBar().showMessage(f"Saved to {Path(path).name}")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save:\n{e}")
+
+    def closeEvent(self, event):
+        if self._dirty:
+            reply = QMessageBox.question(
+                self, "Unsaved Changes",
+                "You have unsaved changes. Save before quitting?",
+                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+            )
+            if reply == QMessageBox.Save:
+                self._save()
+                event.accept()
+            elif reply == QMessageBox.Discard:
+                event.accept()
+            else:
+                event.ignore()
+        else:
+            event.accept()
 
     # ── Rules helpers ────────────────────────────────────────────────────
 
