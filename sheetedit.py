@@ -629,6 +629,177 @@ def delete_snippet(name):
         path.unlink()
 
 
+def _load_snippet_meta(name):
+    """Load a snippet's meta.json. Returns dict or None."""
+    path = SNIPPETS_DIR / f"{name}.meta.json"
+    if path.exists():
+        return json.loads(path.read_text())
+    return None
+
+
+def _copy_cell(src, dst):
+    """Copy value and formatting from one openpyxl cell to another."""
+    dst.value = src.value
+    if src.font:
+        dst.font = src.font.copy()
+    if src.fill:
+        dst.fill = src.fill.copy()
+    if src.alignment:
+        dst.alignment = src.alignment.copy()
+    if src.border:
+        dst.border = src.border.copy()
+    if src.number_format:
+        dst.number_format = src.number_format
+
+
+def _copy_row_formatting(snip_ws, template_row, dst_ws, dst_row, num_cols):
+    """Copy formatting (not values) from a template row to a destination row."""
+    for ci in range(1, num_cols + 1):
+        src = snip_ws.cell(row=template_row, column=ci)
+        dst = dst_ws.cell(row=dst_row, column=ci)
+        if src.font:
+            dst.font = src.font.copy()
+        if src.fill:
+            dst.fill = src.fill.copy()
+        if src.alignment:
+            dst.alignment = src.alignment.copy()
+        if src.border:
+            dst.border = src.border.copy()
+        if src.number_format:
+            dst.number_format = src.number_format
+    # Copy row height
+    if template_row in snip_ws.row_dimensions:
+        h = snip_ws.row_dimensions[template_row].height
+        if h:
+            dst_ws.row_dimensions[dst_row].height = h
+
+
+def _build_snippet_to_ws(ws, snip_name, current_row, data_count=None):
+    """Write a snippet into ws starting at current_row. Returns rows written.
+
+    If data_count is provided and the snippet has a template_row in its meta,
+    the repeating section expands to data_count rows (cloning the template
+    row's formatting). Footer rows shift down accordingly.
+    """
+    path = SNIPPETS_DIR / f"{snip_name}.xlsx"
+    if not path.exists():
+        return 0
+
+    snip_wb = openpyxl.load_workbook(str(path))
+    snip_ws = snip_wb.active
+    snip_rows = snip_ws.max_row or 1
+    snip_cols = snip_ws.max_column or 1
+    meta = _load_snippet_meta(snip_name)
+
+    if meta and meta.get("template_row") and data_count is not None:
+        template_row = meta["template_row"]
+        header_rows = meta.get("header_rows", [])
+        footer_rows = meta.get("footer_rows", [])
+        # Determine how many placeholder rows exist between header and footer
+        placeholder_start = template_row
+        placeholder_end = max(
+            r for r in range(1, snip_rows + 1)
+            if r not in header_rows and r not in footer_rows
+        )
+        num_placeholders = placeholder_end - placeholder_start + 1
+        actual_data_rows = max(data_count, 1)
+
+        dest_row = current_row
+        # 1. Copy header rows
+        for hr in header_rows:
+            for ci in range(1, snip_cols + 1):
+                _copy_cell(snip_ws.cell(row=hr, column=ci),
+                           ws.cell(row=dest_row + hr, column=ci))
+            if hr in snip_ws.row_dimensions:
+                h = snip_ws.row_dimensions[hr].height
+                if h:
+                    ws.row_dimensions[dest_row + hr].height = h
+        dest_row_data_start = current_row + len(header_rows)
+
+        # 2. Create data rows using template row formatting
+        for di in range(actual_data_rows):
+            row_num = dest_row_data_start + di + 1
+            _copy_row_formatting(snip_ws, template_row, ws, row_num, snip_cols)
+
+        dest_row_after_data = dest_row_data_start + actual_data_rows
+
+        # 3. Copy footer rows
+        for fi, fr in enumerate(footer_rows):
+            footer_dest = dest_row_after_data + fi + 1
+            for ci in range(1, snip_cols + 1):
+                _copy_cell(snip_ws.cell(row=fr, column=ci),
+                           ws.cell(row=footer_dest, column=ci))
+            if fr in snip_ws.row_dimensions:
+                h = snip_ws.row_dimensions[fr].height
+                if h:
+                    ws.row_dimensions[footer_dest].height = h
+
+        total_rows = len(header_rows) + actual_data_rows + len(footer_rows)
+
+        # Copy column widths
+        for ci in range(snip_cols):
+            col_letter = get_column_letter(ci + 1)
+            if col_letter in snip_ws.column_dimensions:
+                src_w = snip_ws.column_dimensions[col_letter].width
+                if src_w:
+                    existing = ws.column_dimensions[col_letter].width
+                    if not existing or src_w > existing:
+                        ws.column_dimensions[col_letter].width = src_w
+
+        # Copy merges from header rows (offset to current_row)
+        for rng in snip_ws.merged_cells.ranges:
+            if rng.min_row in header_rows and rng.max_row in header_rows:
+                ws.merge_cells(
+                    start_row=rng.min_row + current_row,
+                    start_column=rng.min_col,
+                    end_row=rng.max_row + current_row,
+                    end_column=rng.max_col,
+                )
+        # Copy merges from footer rows (offset to new position)
+        footer_offset = dest_row_after_data - footer_rows[0] + 1 if footer_rows else 0
+        for rng in snip_ws.merged_cells.ranges:
+            if rng.min_row in footer_rows:
+                ws.merge_cells(
+                    start_row=rng.min_row + footer_offset,
+                    start_column=rng.min_col,
+                    end_row=rng.max_row + footer_offset,
+                    end_column=rng.max_col,
+                )
+
+        return total_rows
+    else:
+        # Static copy — no expansion (original behavior)
+        for ri in range(snip_rows):
+            for ci in range(snip_cols):
+                _copy_cell(snip_ws.cell(row=ri + 1, column=ci + 1),
+                           ws.cell(row=current_row + ri + 1, column=ci + 1))
+
+        for ci in range(snip_cols):
+            col_letter = get_column_letter(ci + 1)
+            if col_letter in snip_ws.column_dimensions:
+                src_w = snip_ws.column_dimensions[col_letter].width
+                if src_w:
+                    existing = ws.column_dimensions[col_letter].width
+                    if not existing or src_w > existing:
+                        ws.column_dimensions[col_letter].width = src_w
+
+        for ri in range(snip_rows):
+            if (ri + 1) in snip_ws.row_dimensions:
+                h = snip_ws.row_dimensions[ri + 1].height
+                if h:
+                    ws.row_dimensions[current_row + ri + 1].height = h
+
+        for rng in snip_ws.merged_cells.ranges:
+            ws.merge_cells(
+                start_row=rng.min_row + current_row,
+                start_column=rng.min_col,
+                end_row=rng.max_row + current_row,
+                end_column=rng.max_col,
+            )
+
+        return snip_rows
+
+
 # ── SheetView — one tab ─────────────────────────────────────────────────────
 
 class SheetView(QTableWidget):
@@ -1286,15 +1457,59 @@ class RulesEditor(QDialog):
 OLLAMA_MODEL = "llama3.3:latest"
 OLLAMA_URL = "http://localhost:11434/api/chat"
 
-CALL_SHEET_SYSTEM_PROMPT = """You are a JSON data extractor. You ONLY output valid JSON. No explanations, no markdown, no commentary. Just a single JSON object."""
+CALL_SHEET_SYSTEM_PROMPT = """You are a JSON data extractor. You ONLY output valid JSON. No explanations, no markdown, no commentary. Just a single JSON object matching EXACTLY the schema provided."""
 
-CALL_SHEET_USER_PROMPT = """Extract crew/call sheet data from the text below into this exact JSON format:
-{"production":"","date":"","location":"","call_time":"","crew":[{"name":"","role":"","call_time":"","wrap_time":"","phone":"","notes":""}]}
 
-Rules:
-- Extract ALL people/crew members
-- Use empty string for missing fields
-- Output ONLY the JSON object, nothing else
+def _build_import_prompt():
+    """Build the user prompt with a tight schema and example."""
+    return """Extract ALL call sheet data from the text below into EXACTLY this JSON structure.
+
+REQUIRED OUTPUT FORMAT:
+{
+  "header": {
+    "title": "SHOW NAME - CALL SHEET - X Pages",
+    "shoot_day": "Day X of Y",
+    "date": "Tuesday, May 5, 2026",
+    "general_call": "9:00 AM",
+    "first_location": "Location Name, Address",
+    "lunch": "3:00 PM",
+    "wrap_target": "9:45 PM"
+  },
+  "scenes": [
+    {"scene_num": "62", "description": "BAR BACK ROOM — Claire confronts", "int_ext": "INT", "day_night": "D5", "pages": "7/8", "cast": "1, 4", "location_notes": "Greenville VFW"}
+  ],
+  "cast": [
+    {"number": "1", "actor": "Grace Patterson", "character": "Claire Bennett", "status": "SW", "set_call": "9:00 AM", "hmu": "8:00 AM", "phone": "555-0100", "notes": "Lead"}
+  ],
+  "crew": [
+    {"position": "Director", "name": "John Smith", "phone": "555-0200", "call_time": "9:00 AM"}
+  ],
+  "key_personnel": {
+    "director": {"name": "", "phone": ""},
+    "producer1": {"name": "", "phone": ""},
+    "producer2": {"name": "", "phone": ""},
+    "first_ad": {"name": "", "phone": ""},
+    "second_ad": {"name": "", "phone": ""},
+    "loc_mgr": {"name": "", "phone": ""}
+  },
+  "weather": {
+    "sunrise": "", "sunset": "", "high": "", "low": "",
+    "precip": "", "condition": "",
+    "hospital_name": "", "hospital_address": "", "hospital_phone": "",
+    "alert": ""
+  },
+  "shooting_order": "SC 62 -> SC 49 -> SC 26 -> Company Move -> SC 27",
+  "notes": {
+    "props": "", "wardrobe": "", "vehicles": "", "bg_atmosphere": ""
+  }
+}
+
+RULES:
+- Extract EVERY scene, cast member, and crew member — do not skip any
+- Include ALL crew from both left and right columns
+- Use "" for missing fields, never null
+- Keep exact names, phone numbers, and times from the source
+- scenes, cast, and crew are arrays — include ALL entries
 
 Text:
 """
@@ -1356,15 +1571,15 @@ def _extract_text_from_pdf(path):
 
 
 def _extract_text_from_xlsx(path):
-    """Extract text from an xlsx file."""
+    """Extract text from an xlsx file (first/active sheet only, skip empty rows)."""
     try:
         wb = openpyxl.load_workbook(path)
-        lines = []
-        for ws in wb.worksheets:
-            for row in ws.iter_rows(values_only=True):
-                vals = [str(v) for v in row if v is not None]
-                if vals:
-                    lines.append("\t".join(vals))
+        ws = wb.active
+        lines = [f"[Sheet: {ws.title}]"]
+        for row in ws.iter_rows(values_only=True):
+            vals = [str(v) for v in row if v is not None]
+            if vals:
+                lines.append("\t".join(vals))
         return "\n".join(lines)
     except Exception as e:
         return f"[XLSX Error: {e}]"
@@ -1386,9 +1601,10 @@ def _extract_text_from_file(path):
         return f"[Unsupported file type: {suffix}]"
 
 
-def _query_ollama(system_prompt, user_prompt):
-    """Send a chat to Ollama and return the response text."""
+def _query_ollama(system_prompt, user_prompt, progress_fn=None):
+    """Send a chat to Ollama with streaming and return the response text."""
     import requests
+    import time
     try:
         resp = requests.post(OLLAMA_URL, json={
             "model": OLLAMA_MODEL,
@@ -1397,18 +1613,41 @@ def _query_ollama(system_prompt, user_prompt):
                 {"role": "user", "content": user_prompt},
             ],
             "format": "json",
-            "stream": False,
-        }, timeout=300)
+            "stream": True,
+        }, timeout=300, stream=True)
         resp.raise_for_status()
-        return resp.json().get("message", {}).get("content", "")
+
+        full_response = ""
+        token_count = 0
+        start_time = time.time()
+
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            chunk = json.loads(line)
+            content = chunk.get("message", {}).get("content", "")
+            if content:
+                full_response += content
+                token_count += 1
+                if progress_fn and token_count % 10 == 0:
+                    elapsed = int(time.time() - start_time)
+                    progress_fn(f"Generating... {token_count} tokens, {elapsed}s elapsed")
+            if chunk.get("done"):
+                break
+
+        if progress_fn:
+            elapsed = int(time.time() - start_time)
+            progress_fn(f"Done — {token_count} tokens in {elapsed}s")
+
+        return full_response
     except Exception as e:
         return f"[Ollama Error: {e}]"
 
 
 def _parse_call_sheet_data(raw_text, log_fn=None):
     """Send extracted text to Ollama to parse into structured JSON."""
-    user_msg = CALL_SHEET_USER_PROMPT + raw_text
-    response = _query_ollama(CALL_SHEET_SYSTEM_PROMPT, user_msg)
+    user_msg = _build_import_prompt() + raw_text
+    response = _query_ollama(CALL_SHEET_SYSTEM_PROMPT, user_msg, progress_fn=log_fn)
 
     if response.startswith("[Ollama"):
         if log_fn:
@@ -1447,48 +1686,181 @@ def _parse_call_sheet_data(raw_text, log_fn=None):
     return None
 
 
-def _fill_call_sheet(wb, data):
-    """Fill a call sheet workbook with structured data. Returns the workbook."""
+def _fill_call_sheet(data):
+    """Build a call sheet from snippets and fill with structured data.
+
+    Uses snippet meta files for dynamic row expansion. Returns a workbook.
+    """
+    wb = openpyxl.Workbook()
     ws = wb.active
+    ws.title = "Call Sheet"
 
-    # Header info
-    if data.get("production"):
-        ws.cell(row=3, column=2, value=data["production"])
-    if data.get("date"):
-        ws.cell(row=4, column=2, value=data["date"])
-    if data.get("location"):
-        ws.cell(row=5, column=2, value=data["location"])
-    if data.get("call_time"):
-        ws.cell(row=6, column=2, value=data["call_time"])
+    # Snippet order and their data key + count mapping
+    snippet_data_map = {
+        "Call Sheet_Header": "header",
+        "Call Sheet_Scenes": "scenes",
+        "Call Sheet_Cast": "cast",
+        "Call Sheet_Crew": "crew",
+        "Call Sheet_KeyPersonel_Weather_Safety": "key_personnel",
+        "Call Sheet_Shooting Order_Company Moves": "shooting_order",
+        "Call Sheet_Notes": "notes",
+    }
+    snippet_order = [
+        "Call Sheet_Header",
+        "Call Sheet_Scenes",
+        "Call Sheet_Cast",
+        "Call Sheet_Crew",
+        "Call Sheet_KeyPersonel_Weather_Safety",
+        "Call Sheet_Shooting Order_Company Moves",
+        "Call Sheet_Notes",
+    ]
 
-    # Crew rows starting at row 9
+    # Determine data counts for expandable snippets
+    data_counts = {}
+    if data.get("scenes"):
+        data_counts["Call Sheet_Scenes"] = len(data["scenes"])
+    if data.get("cast"):
+        data_counts["Call Sheet_Cast"] = len(data["cast"])
+    if data.get("crew"):
+        # Crew uses two-column layout, so half the count (rounded up)
+        data_counts["Call Sheet_Crew"] = (len(data["crew"]) + 1) // 2
+
+    # Build snippets
+    current_row = 0
+    snippet_positions = {}  # track where each snippet starts for data filling
+    for name in snippet_order:
+        path = SNIPPETS_DIR / f"{name}.xlsx"
+        if not path.exists():
+            continue
+        snippet_positions[name] = current_row
+        dc = data_counts.get(name)
+        rows_written = _build_snippet_to_ws(ws, name, current_row, data_count=dc)
+        current_row += rows_written
+
+    # Now fill in the actual data values
+    header = data.get("header", {})
+    if header and "Call Sheet_Header" in snippet_positions:
+        base = snippet_positions["Call Sheet_Header"]
+        if header.get("title"):
+            ws.cell(row=base + 1, column=1).value = header["title"]
+        if header.get("shoot_day"):
+            ws.cell(row=base + 2, column=1).value = header["shoot_day"]
+        if header.get("date"):
+            ws.cell(row=base + 2, column=7).value = header["date"]
+        if header.get("general_call"):
+            ws.cell(row=base + 3, column=4).value = header["general_call"]
+        if header.get("first_location"):
+            ws.cell(row=base + 3, column=10).value = header["first_location"]
+        if header.get("lunch"):
+            ws.cell(row=base + 4, column=4).value = header["lunch"]
+        if header.get("wrap_target"):
+            ws.cell(row=base + 4, column=10).value = header["wrap_target"]
+
+    scenes = data.get("scenes", [])
+    if scenes and "Call Sheet_Scenes" in snippet_positions:
+        base = snippet_positions["Call Sheet_Scenes"]
+        meta = _load_snippet_meta("Call Sheet_Scenes")
+        data_start = base + len(meta["header_rows"]) + 1 if meta else base + 3
+        for i, sc in enumerate(scenes):
+            r = data_start + i
+            ws.cell(row=r, column=1).value = sc.get("scene_num", "")
+            ws.cell(row=r, column=2).value = sc.get("description", "")
+            ws.cell(row=r, column=5).value = sc.get("int_ext", "")
+            ws.cell(row=r, column=6).value = sc.get("day_night", "")
+            ws.cell(row=r, column=7).value = sc.get("pages", "")
+            ws.cell(row=r, column=8).value = sc.get("cast", "")
+            ws.cell(row=r, column=9).value = sc.get("location_notes", "")
+
+    cast = data.get("cast", [])
+    if cast and "Call Sheet_Cast" in snippet_positions:
+        base = snippet_positions["Call Sheet_Cast"]
+        meta = _load_snippet_meta("Call Sheet_Cast")
+        data_start = base + len(meta["header_rows"]) + 1 if meta else base + 3
+        for i, c in enumerate(cast):
+            r = data_start + i
+            ws.cell(row=r, column=1).value = c.get("number", str(i + 1))
+            ws.cell(row=r, column=2).value = c.get("actor", "")
+            ws.cell(row=r, column=3).value = c.get("character", "")
+            ws.cell(row=r, column=4).value = c.get("status", "")
+            ws.cell(row=r, column=5).value = c.get("set_call", "")
+            ws.cell(row=r, column=6).value = c.get("hmu", "")
+            ws.cell(row=r, column=7).value = c.get("phone", "")
+            ws.cell(row=r, column=8).value = c.get("notes", "")
+
     crew = data.get("crew", [])
-    for i, member in enumerate(crew):
-        row = 9 + i
-        ws.cell(row=row, column=1, value=member.get("name", ""))
-        ws.cell(row=row, column=2, value=member.get("role", ""))
-        ws.cell(row=row, column=3, value=member.get("call_time", ""))
-        ws.cell(row=row, column=4, value=member.get("wrap_time", ""))
-        ws.cell(row=row, column=5, value=member.get("phone", ""))
-        ws.cell(row=row, column=6, value=member.get("notes", ""))
+    if crew and "Call Sheet_Crew" in snippet_positions:
+        base = snippet_positions["Call Sheet_Crew"]
+        meta = _load_snippet_meta("Call Sheet_Crew")
+        data_start = base + len(meta["header_rows"]) + 1 if meta else base + 3
+        # Two-column layout: left side cols A-F, right side cols H-M
+        for i, cr in enumerate(crew):
+            row_offset = i // 2
+            r = data_start + row_offset
+            if i % 2 == 0:  # left side
+                ws.cell(row=r, column=1).value = cr.get("position", "")
+                ws.cell(row=r, column=3).value = cr.get("name", "")
+                ws.cell(row=r, column=5).value = cr.get("phone", "")
+                ws.cell(row=r, column=6).value = cr.get("call_time", "")
+            else:  # right side
+                ws.cell(row=r, column=8).value = cr.get("position", "")
+                ws.cell(row=r, column=10).value = cr.get("name", "")
+                ws.cell(row=r, column=12).value = cr.get("phone", "")
+                ws.cell(row=r, column=13).value = cr.get("call_time", "")
 
-        # Apply consistent formatting to each crew row
-        for c in range(1, 7):
-            cell = ws.cell(row=row, column=c)
-            cell.font = XlFont(name="Arial", size=11)
-            cell.alignment = Alignment(vertical="center")
-            # Alternating row fill
-            if i % 2 == 1:
-                cell.fill = PatternFill(
-                    start_color="FFF2E6", end_color="FFF2E6", fill_type="solid"
-                )
-            # Light borders
-            cell.border = Border(
-                top=Side(style="thin", color="DADCE0"),
-                bottom=Side(style="thin", color="DADCE0"),
-                left=Side(style="thin", color="DADCE0"),
-                right=Side(style="thin", color="DADCE0"),
-            )
+    kp = data.get("key_personnel", {})
+    if kp and "Call Sheet_KeyPersonel_Weather_Safety" in snippet_positions:
+        base = snippet_positions["Call Sheet_KeyPersonel_Weather_Safety"]
+        personnel = [
+            ("director", 2), ("producer1", 3), ("producer2", 4),
+            ("first_ad", 5), ("second_ad", 6), ("loc_mgr", 7),
+        ]
+        for key, row_off in personnel:
+            person = kp.get(key, {})
+            if person.get("name"):
+                ws.cell(row=base + row_off, column=2).value = person["name"]
+            if person.get("phone"):
+                ws.cell(row=base + row_off, column=5).value = person["phone"]
+
+    weather = data.get("weather", {})
+    if weather and "Call Sheet_KeyPersonel_Weather_Safety" in snippet_positions:
+        base = snippet_positions["Call Sheet_KeyPersonel_Weather_Safety"]
+        if weather.get("sunrise"):
+            ws.cell(row=base + 2, column=8).value = weather["sunrise"]
+        if weather.get("sunset"):
+            ws.cell(row=base + 3, column=8).value = weather["sunset"]
+        if weather.get("high"):
+            ws.cell(row=base + 4, column=8).value = weather["high"]
+        if weather.get("low"):
+            ws.cell(row=base + 5, column=8).value = weather["low"]
+        if weather.get("precip"):
+            ws.cell(row=base + 6, column=8).value = weather["precip"]
+        if weather.get("condition"):
+            ws.cell(row=base + 7, column=8).value = weather["condition"]
+        if weather.get("hospital_name"):
+            ws.cell(row=base + 3, column=10).value = weather["hospital_name"]
+        if weather.get("hospital_address"):
+            ws.cell(row=base + 5, column=10).value = weather["hospital_address"]
+        if weather.get("hospital_phone"):
+            ws.cell(row=base + 7, column=10).value = weather["hospital_phone"]
+        if weather.get("alert"):
+            ws.cell(row=base + 9, column=1).value = weather["alert"]
+
+    shooting = data.get("shooting_order", "")
+    if shooting and "Call Sheet_Shooting Order_Company Moves" in snippet_positions:
+        base = snippet_positions["Call Sheet_Shooting Order_Company Moves"]
+        ws.cell(row=base + 2, column=1).value = shooting
+
+    notes = data.get("notes", {})
+    if notes and "Call Sheet_Notes" in snippet_positions:
+        base = snippet_positions["Call Sheet_Notes"]
+        if notes.get("props"):
+            ws.cell(row=base + 3, column=1).value = notes["props"]
+        if notes.get("wardrobe"):
+            ws.cell(row=base + 3, column=4).value = notes["wardrobe"]
+        if notes.get("vehicles"):
+            ws.cell(row=base + 3, column=7).value = notes["vehicles"]
+        if notes.get("bg_atmosphere"):
+            ws.cell(row=base + 3, column=10).value = notes["bg_atmosphere"]
 
     return wb
 
@@ -1624,6 +1996,16 @@ class ImportCallSheetDialog(QDialog):
         QTimer.singleShot(100, self._run_import)
 
     def _log(self, msg):
+        # If message starts with "Generating..." or "Done —", update last line
+        if msg.startswith("Generating...") or msg.startswith("Done —"):
+            count = self.log_text.count()
+            if count > 0:
+                last = self.log_text.item(count - 1)
+                if last.text().startswith("Generating...") or last.text().startswith("Sending to"):
+                    last.setText(msg)
+                    self.log_text.scrollToBottom()
+                    QApplication.processEvents()
+                    return
         self.log_text.addItem(msg)
         self.log_text.scrollToBottom()
         QApplication.processEvents()
@@ -1637,7 +2019,7 @@ class ImportCallSheetDialog(QDialog):
         for f in self.files:
             self._log(f"Reading: {Path(f).name}")
             text = _extract_text_from_file(f)
-            if text and not text.startswith("["):
+            if text and not text.startswith("[XLSX Error") and not text.startswith("[OCR Error") and not text.startswith("[PDF Error") and not text.startswith("[Unsupported") and not text.startswith("[Could not") and not text.startswith("[No text"):
                 all_text.append(text)
                 self._log(f"  Extracted {len(text)} characters")
             else:
@@ -1672,15 +2054,11 @@ class ImportCallSheetDialog(QDialog):
         self.status_label.setText("Step 3/3: Building call sheet...")
         QApplication.processEvents()
 
-        # Use the built-in call sheet template
-        builder = BUILTIN_TEMPLATES.get("Call Sheet")
-        if builder:
-            wb = builder()
-        else:
-            wb = openpyxl.Workbook()
-
-        self.result_wb = _fill_call_sheet(wb, data)
-        self._log(f"Call sheet built with {crew_count} crew rows.")
+        # Build from snippets with dynamic row expansion
+        self.result_wb = _fill_call_sheet(data)
+        self._log(f"Call sheet built from snippets with {crew_count} crew, "
+                  f"{len(data.get('scenes', []))} scenes, "
+                  f"{len(data.get('cast', []))} cast.")
         self.status_label.setText("Import complete!")
         self.cancel_btn.setText("Done")
         self.cancel_btn.clicked.disconnect()
@@ -1782,62 +2160,10 @@ class SnippetComposer(QDialog):
         ws.title = "Sheet"
 
         current_row = 0
-        max_col = 0
-
         for i in range(self.order_list.count()):
             name = self.order_list.item(i).text()
-            path = SNIPPETS_DIR / f"{name}.xlsx"
-            if not path.exists():
-                continue
-
-            snip_wb = openpyxl.load_workbook(str(path))
-            snip_ws = snip_wb.active
-            snip_rows = snip_ws.max_row or 1
-            snip_cols = snip_ws.max_column or 1
-            max_col = max(max_col, snip_cols)
-
-            # Copy cells
-            for ri in range(snip_rows):
-                for ci in range(snip_cols):
-                    src = snip_ws.cell(row=ri + 1, column=ci + 1)
-                    dst = ws.cell(row=current_row + ri + 1, column=ci + 1)
-                    dst.value = src.value
-                    if src.font:
-                        dst.font = src.font.copy()
-                    if src.fill:
-                        dst.fill = src.fill.copy()
-                    if src.alignment:
-                        dst.alignment = src.alignment.copy()
-                    if src.border:
-                        dst.border = src.border.copy()
-
-            # Column widths (use widest from any snippet)
-            for ci in range(snip_cols):
-                col_letter = get_column_letter(ci + 1)
-                if col_letter in snip_ws.column_dimensions:
-                    src_w = snip_ws.column_dimensions[col_letter].width
-                    if src_w:
-                        existing = ws.column_dimensions[col_letter].width
-                        if not existing or src_w > existing:
-                            ws.column_dimensions[col_letter].width = src_w
-
-            # Row heights
-            for ri in range(snip_rows):
-                if (ri + 1) in snip_ws.row_dimensions:
-                    h = snip_ws.row_dimensions[ri + 1].height
-                    if h:
-                        ws.row_dimensions[current_row + ri + 1].height = h
-
-            # Merges
-            for rng in snip_ws.merged_cells.ranges:
-                ws.merge_cells(
-                    start_row=rng.min_row + current_row,
-                    start_column=rng.min_col,
-                    end_row=rng.max_row + current_row,
-                    end_column=rng.max_col,
-                )
-
-            current_row += snip_rows
+            rows_written = _build_snippet_to_ws(ws, name, current_row)
+            current_row += rows_written
 
         self.result_wb = wb
         self.accept()
