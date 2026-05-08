@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
     QToolBar, QFileDialog, QColorDialog, QMessageBox, QVBoxLayout, QWidget,
     QLabel, QStatusBar, QMenu, QMenuBar, QSizePolicy, QStyledItemDelegate,
     QStyleOptionViewItem, QDialog, QHBoxLayout, QListWidget, QListWidgetItem,
-    QPushButton, QLineEdit, QInputDialog, QGridLayout, QFrame,
+    QPushButton, QLineEdit, QInputDialog, QGridLayout, QFrame, QPlainTextEdit,
 )
 from PySide6.QtPrintSupport import QPrinter, QPrintDialog, QPrintPreviewDialog
 from PySide6.QtGui import QPageLayout
@@ -123,6 +123,7 @@ VALIGN_MAP = {"top": Qt.AlignTop, "center": Qt.AlignVCenter, "bottom": Qt.AlignB
 
 TEMPLATES_DIR = Path.home() / ".sheetedit" / "templates"
 SNIPPETS_DIR = Path.home() / ".sheetedit" / "snippets"
+IMPORT_GUIDE_PATH = Path.home() / ".sheetedit" / "import_guide.md"
 
 
 def _ensure_templates_dir():
@@ -1939,6 +1940,10 @@ class SheetEditWindow(QMainWindow):
         compose_act.triggered.connect(self._snippet_compose)
         file_menu.addAction(compose_act)
 
+        guide_act = QAction("Edit Import Guide...", self)
+        guide_act.triggered.connect(self._edit_import_guide)
+        file_menu.addAction(guide_act)
+
         file_menu.addSeparator()
 
         preview_act = QAction("Print...", self)
@@ -2207,6 +2212,49 @@ class SheetEditWindow(QMainWindow):
             self.setWindowTitle("SheetEdit — Composed Document")
             self._reload_tabs()
             self.statusBar().showMessage("Built document from snippets")
+
+    def _edit_import_guide(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Import Guide")
+        dlg.resize(700, 600)
+        layout = QVBoxLayout(dlg)
+
+        info = QLabel("This guide tells the AI how to map imported data to your call sheet snippets.")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        editor = QPlainTextEdit()
+        editor.setFont(QFont("Menlo", 12))
+        editor.setLineWrapMode(QPlainTextEdit.NoWrap)
+        # Load existing guide
+        if IMPORT_GUIDE_PATH.exists():
+            editor.setPlainText(IMPORT_GUIDE_PATH.read_text())
+        else:
+            editor.setPlainText("# Import Guide\n\nNo guide file found. Add instructions here.\n")
+        layout.addWidget(editor)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        save_btn = QPushButton("Save")
+        save_btn.setStyleSheet(
+            "QPushButton { background-color: #1A73E8; color: white; "
+            "font-weight: bold; padding: 6px 20px; border-radius: 4px; }"
+            "QPushButton:hover { background-color: #1557B0; }"
+        )
+        save_btn.clicked.connect(lambda: self._save_import_guide(editor.toPlainText(), dlg))
+        btn_row.addWidget(save_btn)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(dlg.reject)
+        btn_row.addWidget(cancel_btn)
+        layout.addLayout(btn_row)
+
+        dlg.exec()
+
+    def _save_import_guide(self, text, dlg):
+        IMPORT_GUIDE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        IMPORT_GUIDE_PATH.write_text(text)
+        self.statusBar().showMessage("Import guide saved")
+        dlg.accept()
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
