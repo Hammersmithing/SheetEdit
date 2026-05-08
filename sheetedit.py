@@ -11,7 +11,9 @@ from PySide6.QtWidgets import (
     QLabel, QStatusBar, QMenu, QMenuBar, QSizePolicy, QStyledItemDelegate,
     QStyleOptionViewItem,
 )
-from PySide6.QtCore import Qt, QSize, QRect, QModelIndex
+from PySide6.QtPrintSupport import QPrinter, QPrintDialog, QPrintPreviewDialog
+from PySide6.QtGui import QPageLayout
+from PySide6.QtCore import Qt, QSize, QRect, QRectF, QModelIndex, QPointF
 from PySide6.QtGui import (
     QAction, QColor, QFont, QBrush, QIcon, QKeySequence, QPainter, QPen,
     QShortcut, QFontMetrics,
@@ -486,6 +488,17 @@ class SheetEditWindow(QMainWindow):
         saveas_act.triggered.connect(self._save_as)
         file_menu.addAction(saveas_act)
 
+        file_menu.addSeparator()
+
+        preview_act = QAction("Print Preview...", self)
+        preview_act.triggered.connect(self._print_preview)
+        file_menu.addAction(preview_act)
+
+        print_act = QAction("Print...", self)
+        print_act.setShortcut(QKeySequence.Print)
+        print_act.triggered.connect(self._print)
+        file_menu.addAction(print_act)
+
         edit_menu = mb.addMenu("Edit")
 
         ins_row = QAction("Insert Row", self)
@@ -673,6 +686,131 @@ class SheetEditWindow(QMainWindow):
             self.statusBar().showMessage(f"Saved to {Path(path).name}")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save:\n{e}")
+
+    # ── Print ────────────────────────────────────────────────────────────
+
+    def _print_preview(self):
+        sv = self._sheet()
+        if sv is None:
+            return
+        printer = QPrinter(QPrinter.HighResolution)
+        printer.setPageOrientation(QPageLayout.Landscape)
+        dialog = QPrintPreviewDialog(printer, self)
+        dialog.paintRequested.connect(lambda p: self._render_sheet(p, sv))
+        dialog.exec()
+
+    def _print(self):
+        sv = self._sheet()
+        if sv is None:
+            return
+        printer = QPrinter(QPrinter.HighResolution)
+        printer.setPageOrientation(QPageLayout.Landscape)
+        dialog = QPrintDialog(printer, self)
+        if dialog.exec() == QPrintDialog.Accepted:
+            self._render_sheet(printer, sv)
+
+    def _render_sheet(self, printer, sv: "SheetView"):
+        """Render the current sheet onto a QPrinter with pagination."""
+        painter = QPainter()
+        if not painter.begin(printer):
+            return
+
+        page_rect = printer.pageRect(QPrinter.DevicePixel)
+        pw = page_rect.width()
+        ph = page_rect.height()
+
+        # Gather column widths and row heights in screen pixels
+        col_widths = [sv.columnWidth(c) for c in range(sv.columnCount())]
+        row_heights = [sv.rowHeight(r) for r in range(sv.rowCount())]
+
+        # Scale: fit all columns to page width
+        total_col_w = sum(col_widths)
+        if total_col_w <= 0:
+            painter.end()
+            return
+        scale = pw / total_col_w
+        # Cap scale so rows aren't absurdly large
+        max_scale = ph / 40  # at least 40px row equivalent per page
+        if scale > max_scale:
+            scale = max_scale
+
+        scaled_col_widths = [w * scale for w in col_widths]
+        scaled_row_heights = [h * scale for h in row_heights]
+
+        # Paginate rows
+        pages = []  # list of (start_row, end_row)
+        current_y = 0
+        page_start = 0
+        for ri, rh in enumerate(scaled_row_heights):
+            if current_y + rh > ph and ri > page_start:
+                pages.append((page_start, ri - 1))
+                page_start = ri
+                current_y = rh
+            else:
+                current_y += rh
+        pages.append((page_start, len(scaled_row_heights) - 1))
+
+        for page_idx, (row_start, row_end) in enumerate(pages):
+            if page_idx > 0:
+                printer.newPage()
+
+            y = 0.0
+            for ri in range(row_start, row_end + 1):
+                x = 0.0
+                rh = scaled_row_heights[ri]
+
+                for ci in range(sv.columnCount()):
+                    cw = scaled_col_widths[ci]
+                    cell_rect = QRectF(x, y, cw, rh)
+
+                    item = sv.item(ri, ci)
+                    if item:
+                        # Fill
+                        bg = item.background()
+                        if bg != QBrush() and bg.color().isValid() and bg.color() != QColor("#FFFFFF"):
+                            painter.fillRect(cell_rect, bg)
+
+                        # Borders
+                        bd = item.data(BORDER_ROLE)
+                        if bd:
+                            for side_name, coords in [
+                                ("top", (x, y, x + cw, y)),
+                                ("bottom", (x, y + rh, x + cw, y + rh)),
+                                ("left", (x, y, x, y + rh)),
+                                ("right", (x + cw, y, x + cw, y + rh)),
+                            ]:
+                                info = bd.get(side_name)
+                                if info:
+                                    color_hex, width, style = info
+                                    pen = QPen(QColor(color_hex), width * scale * 0.5, style)
+                                    painter.setPen(pen)
+                                    painter.drawLine(QPointF(coords[0], coords[1]), QPointF(coords[2], coords[3]))
+
+                        # Text
+                        text = item.text()
+                        if text:
+                            qf = QFont(item.font())
+                            qf.setPointSizeF(qf.pointSizeF() * scale / printer.logicalDpiY() * 72.0)
+                            painter.setFont(qf)
+
+                            fg = item.foreground()
+                            if fg != QBrush():
+                                painter.setPen(QPen(fg.color()))
+                            else:
+                                painter.setPen(QPen(QColor("#202124")))
+
+                            flags = item.textAlignment()
+                            text_rect = cell_rect.adjusted(3 * scale, 1 * scale, -3 * scale, -1 * scale)
+                            painter.drawText(text_rect, flags, text)
+
+                    # Grid line
+                    painter.setPen(QPen(QColor("#E2E2E2"), 0.5))
+                    painter.drawRect(cell_rect)
+
+                    x += cw
+                y += rh
+
+        painter.end()
 
     # ── Selection helpers ────────────────────────────────────────────────
 
