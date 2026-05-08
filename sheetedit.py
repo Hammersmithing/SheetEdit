@@ -1926,10 +1926,16 @@ class SheetEditWindow(QMainWindow):
         # Find the preview widget inside the dialog
         preview = dialog.findChild(QPrintPreviewWidget)
 
-        # Add portrait/landscape buttons to the preview toolbar
+        # Customize the toolbar
         toolbars = dialog.findChildren(QToolBar)
         if toolbars and preview:
             tb = toolbars[0]
+
+            # Remove the default print button (first action)
+            actions = tb.actions()
+            if actions:
+                tb.removeAction(actions[0])
+
             tb.addSeparator()
             portrait_act = QAction("Portrait", dialog)
             portrait_act.triggered.connect(preview.setPortraitOrientation)
@@ -1938,14 +1944,25 @@ class SheetEditWindow(QMainWindow):
             landscape_act.triggered.connect(preview.setLandscapeOrientation)
             tb.addAction(landscape_act)
 
+            # Add spacer to push PRINT to the right
+            spacer = QWidget()
+            spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+            tb.addWidget(spacer)
+
+            print_btn = QPushButton("PRINT")
+            print_btn.setStyleSheet(
+                "QPushButton { background-color: #1A73E8; color: white; "
+                "font-weight: bold; padding: 6px 20px; border-radius: 4px; "
+                "font-size: 13px; }"
+                "QPushButton:hover { background-color: #1557B0; }"
+            )
+            print_btn.clicked.connect(lambda: (dialog.accept(), self._do_print(printer, sv)))
+            tb.addWidget(print_btn)
+
         dialog.exec()
 
-    def _print(self):
-        sv = self._sheet()
-        if sv is None:
-            return
-        printer = QPrinter(QPrinter.ScreenResolution)
-        printer.setPageOrientation(self._auto_orientation(sv))
+    def _do_print(self, printer, sv):
+        """Print using the already-configured printer from preview."""
         dialog = QPrintDialog(printer, self)
         if dialog.exec() == QPrintDialog.Accepted:
             self._render_sheet(printer, sv)
