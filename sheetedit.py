@@ -3,6 +3,7 @@
 
 import sys
 import os
+import json
 import shutil
 from pathlib import Path
 
@@ -23,6 +24,7 @@ from PySide6.QtGui import (
 
 import openpyxl
 from openpyxl.utils import get_column_letter
+from openpyxl.utils.cell import range_boundaries
 from openpyxl.styles import Font as XlFont, PatternFill, Alignment, Border, Side
 
 
@@ -120,10 +122,15 @@ VALIGN_MAP = {"top": Qt.AlignTop, "center": Qt.AlignVCenter, "bottom": Qt.AlignB
 # ── Templates ────────────────────────────────────────────────────────────────
 
 TEMPLATES_DIR = Path.home() / ".sheetedit" / "templates"
+SNIPPETS_DIR = Path.home() / ".sheetedit" / "snippets"
 
 
 def _ensure_templates_dir():
     TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _ensure_snippets_dir():
+    SNIPPETS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _builtin_templates():
@@ -311,6 +318,7 @@ def _side_to_pen(side):
 
 # Store border info as a role on QTableWidgetItem
 BORDER_ROLE = Qt.UserRole + 100  # dict: {top, bottom, left, right} → (color, width, style)
+RULE_ROLE = Qt.UserRole + 101    # bool: True if cell is in a ruled range
 
 
 class BorderDelegate(QStyledItemDelegate):
@@ -320,28 +328,295 @@ class BorderDelegate(QStyledItemDelegate):
         # Draw default content first
         super().paint(painter, option, index)
 
-        # Get border data
-        border_data = index.data(BORDER_ROLE)
-        if not border_data:
-            return
-
         painter.save()
         rect = option.rect
 
-        for side_name, edge in [
-            ("top", (rect.left(), rect.top(), rect.right(), rect.top())),
-            ("bottom", (rect.left(), rect.bottom(), rect.right(), rect.bottom())),
-            ("left", (rect.left(), rect.top(), rect.left(), rect.bottom())),
-            ("right", (rect.right(), rect.top(), rect.right(), rect.bottom())),
-        ]:
-            info = border_data.get(side_name)
-            if info:
-                color_hex, width, style = info
-                pen = QPen(QColor(color_hex), width, style)
-                painter.setPen(pen)
-                painter.drawLine(*edge)
+        # Draw borders
+        border_data = index.data(BORDER_ROLE)
+        if border_data:
+            for side_name, edge in [
+                ("top", (rect.left(), rect.top(), rect.right(), rect.top())),
+                ("bottom", (rect.left(), rect.bottom(), rect.right(), rect.bottom())),
+                ("left", (rect.left(), rect.top(), rect.left(), rect.bottom())),
+                ("right", (rect.right(), rect.top(), rect.right(), rect.bottom())),
+            ]:
+                info = border_data.get(side_name)
+                if info:
+                    color_hex, width, style = info
+                    pen = QPen(QColor(color_hex), width, style)
+                    painter.setPen(pen)
+                    painter.drawLine(*edge)
+
+        # Draw blue dot for ruled cells
+        if index.data(RULE_ROLE):
+            painter.setBrush(QBrush(QColor("#1A73E8")))
+            painter.setPen(Qt.NoPen)
+            painter.drawEllipse(rect.right() - 7, rect.top() + 2, 5, 5)
 
         painter.restore()
+
+
+# ── Cell Conversion Helpers ──────────────────────────────────────────────────
+
+def _xl_cell_to_item(cell):
+    """Convert an openpyxl cell to a QTableWidgetItem."""
+    item = QTableWidgetItem()
+
+    # Value
+    val = cell.value
+    if val is not None:
+        item.setText(str(val))
+
+    # Font
+    qf = QFont()
+    if cell.font:
+        qf.setFamily(cell.font.name or "Arial")
+        qf.setPointSize(cell.font.size or 11)
+        qf.setBold(cell.font.bold or False)
+        qf.setItalic(cell.font.italic or False)
+        qf.setUnderline(
+            cell.font.underline is not None
+            and cell.font.underline != "none"
+        )
+        fc = xl_color_to_qcolor(cell.font.color, QColor("#202124"))
+        item.setForeground(QBrush(fc if fc else QColor("#202124")))
+    else:
+        item.setForeground(QBrush(QColor("#202124")))
+    item.setFont(qf)
+
+    # Fill
+    has_fill = False
+    if cell.fill and cell.fill.fgColor:
+        bg = xl_color_to_qcolor(cell.fill.fgColor)
+        if bg and bg.isValid() and bg != QColor(0, 0, 0):
+            item.setBackground(QBrush(bg))
+            has_fill = True
+    if not has_fill:
+        item.setBackground(QBrush(QColor("#FFFFFF")))
+
+    # Alignment
+    flags = Qt.AlignLeft | Qt.AlignVCenter
+    if cell.alignment:
+        h = HALIGN_MAP.get(cell.alignment.horizontal, Qt.AlignLeft)
+        v = VALIGN_MAP.get(cell.alignment.vertical, Qt.AlignVCenter)
+        flags = h | v
+        if cell.alignment.wrap_text:
+            flags |= Qt.TextWordWrap
+    item.setTextAlignment(flags)
+
+    # Borders
+    if cell.border:
+        bd = {}
+        for side_name in ("top", "bottom", "left", "right"):
+            side = getattr(cell.border, side_name, None)
+            pen_info = _side_to_pen(side)
+            if pen_info:
+                bd[side_name] = pen_info
+        if bd:
+            item.setData(BORDER_ROLE, bd)
+
+    return item
+
+
+def _item_to_xl_cell(item, cell):
+    """Write a QTableWidgetItem's data into an openpyxl cell."""
+    if item is None:
+        cell.value = None
+        return
+
+    cell.value = item.text() or None
+
+    # Font
+    qf = item.font()
+    fg_brush = item.foreground()
+    fg_color = (
+        fg_brush.color()
+        if fg_brush != QBrush()
+        else QColor("#202124")
+    )
+    cell.font = XlFont(
+        name=qf.family(),
+        size=qf.pointSize(),
+        bold=qf.bold(),
+        italic=qf.italic(),
+        underline="single" if qf.underline() else None,
+        color=qcolor_to_xl_rgb(fg_color),
+    )
+
+    # Fill
+    bg_brush = item.background()
+    if bg_brush != QBrush() and bg_brush.color().isValid():
+        bgc = bg_brush.color()
+        if bgc != QColor("#FFFFFF"):
+            cell.fill = PatternFill(
+                start_color=qcolor_to_xl_rgb(bgc),
+                end_color=qcolor_to_xl_rgb(bgc),
+                fill_type="solid",
+            )
+        else:
+            cell.fill = PatternFill(fill_type=None)
+    else:
+        cell.fill = PatternFill(fill_type=None)
+
+    # Alignment
+    flags = item.textAlignment()
+    ha = "left"
+    if flags & Qt.AlignHCenter:
+        ha = "center"
+    elif flags & Qt.AlignRight:
+        ha = "right"
+    va = "center"
+    if flags & Qt.AlignTop:
+        va = "top"
+    elif flags & Qt.AlignBottom:
+        va = "bottom"
+    wrap = bool(flags & Qt.TextWordWrap)
+    cell.alignment = Alignment(
+        horizontal=ha, vertical=va, wrap_text=wrap
+    )
+
+    # Borders
+    bd = item.data(BORDER_ROLE)
+    if bd:
+        sides = {}
+        for side_name in ("top", "bottom", "left", "right"):
+            info = bd.get(side_name)
+            if info:
+                color_hex, width, _ = info
+                style = "thin"
+                if width >= 3:
+                    style = "thick"
+                elif width >= 2:
+                    style = "medium"
+                sides[side_name] = Side(
+                    style=style,
+                    color=qcolor_to_xl_rgb(QColor(color_hex)),
+                )
+            else:
+                sides[side_name] = Side(style=None)
+        cell.border = Border(**sides)
+
+
+# ── Snippet helpers ─────────────────────────────────────────────────────────
+
+def save_snippet(name, sv, r1, c1, r2, c2):
+    """Save the selected rectangle from a SheetView as a snippet .xlsx."""
+    _ensure_snippets_dir()
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Snippet"
+
+    rows = r2 - r1 + 1
+    cols = c2 - c1 + 1
+
+    for ri in range(rows):
+        for ci in range(cols):
+            item = sv.item(r1 + ri, c1 + ci)
+            dest_cell = ws.cell(row=ri + 1, column=ci + 1)
+            _item_to_xl_cell(item, dest_cell)
+
+    # Column widths
+    for ci in range(cols):
+        col_letter = get_column_letter(ci + 1)
+        ws.column_dimensions[col_letter].width = px_to_xl_col_width(
+            sv.columnWidth(c1 + ci)
+        )
+
+    # Row heights
+    for ri in range(rows):
+        ws.row_dimensions[ri + 1].height = px_to_xl_row_height(
+            sv.rowHeight(r1 + ri)
+        )
+
+    # Merges offset to (0,0)
+    for m in sv.merges:
+        mr1, mc1, mr2, mc2 = m
+        # Check overlap with selection
+        if mr1 >= r1 and mr2 <= r2 and mc1 >= c1 and mc2 <= c2:
+            ws.merge_cells(
+                start_row=mr1 - r1 + 1, start_column=mc1 - c1 + 1,
+                end_row=mr2 - r1 + 1, end_column=mc2 - c1 + 1,
+            )
+
+    wb.save(str(SNIPPETS_DIR / f"{name}.xlsx"))
+
+
+def insert_snippet(name, sv, dest_r, dest_c):
+    """Load a snippet .xlsx and insert its cells at (dest_r, dest_c) in sv."""
+    path = SNIPPETS_DIR / f"{name}.xlsx"
+    if not path.exists():
+        return
+    wb = openpyxl.load_workbook(str(path))
+    ws = wb.active
+
+    rows = ws.max_row or 1
+    cols = ws.max_column or 1
+
+    # Expand sheet if needed
+    needed_rows = dest_r + rows
+    needed_cols = dest_c + cols
+    if sv.rowCount() < needed_rows:
+        sv.setRowCount(needed_rows)
+    if sv.columnCount() < needed_cols:
+        sv.setColumnCount(needed_cols)
+        sv.setHorizontalHeaderLabels(
+            [get_column_letter(c + 1) for c in range(sv.columnCount())]
+        )
+
+    # Push undo for destination area
+    cells = []
+    for ri in range(rows):
+        for ci in range(cols):
+            cells.append((dest_r + ri, dest_c + ci))
+    sv.push_undo(cells)
+
+    # Insert cells
+    sv._tracking_edits = False
+    for ri in range(rows):
+        for ci in range(cols):
+            cell = ws.cell(row=ri + 1, column=ci + 1)
+            item = _xl_cell_to_item(cell)
+            sv.setItem(dest_r + ri, dest_c + ci, item)
+    sv._tracking_edits = True
+
+    # Column widths
+    for ci in range(cols):
+        col_letter = get_column_letter(ci + 1)
+        if col_letter in ws.column_dimensions:
+            w = ws.column_dimensions[col_letter].width
+            if w:
+                sv.setColumnWidth(dest_c + ci, xl_col_width_to_px(w))
+
+    # Row heights
+    for ri in range(rows):
+        if (ri + 1) in ws.row_dimensions:
+            h = ws.row_dimensions[ri + 1].height
+            if h:
+                sv.setRowHeight(dest_r + ri, xl_row_height_to_px(h))
+
+    # Merges offset to destination
+    for rng in ws.merged_cells.ranges:
+        mr1, mc1 = rng.min_row - 1, rng.min_col - 1
+        mr2, mc2 = rng.max_row - 1, rng.max_col - 1
+        new_r1 = dest_r + mr1
+        new_c1 = dest_c + mc1
+        new_r2 = dest_r + mr2
+        new_c2 = dest_c + mc2
+        sv.setSpan(new_r1, new_c1, new_r2 - new_r1 + 1, new_c2 - new_c1 + 1)
+        sv.merges.append((new_r1, new_c1, new_r2, new_c2))
+
+
+def list_snippets():
+    """Return sorted list of snippet names."""
+    _ensure_snippets_dir()
+    return sorted(p.stem for p in SNIPPETS_DIR.glob("*.xlsx"))
+
+
+def delete_snippet(name):
+    """Delete a snippet file."""
+    path = SNIPPETS_DIR / f"{name}.xlsx"
+    if path.exists():
+        path.unlink()
 
 
 # ── SheetView — one tab ─────────────────────────────────────────────────────
@@ -434,6 +709,89 @@ class SheetView(QTableWidget):
             return
         # For single cell edits, we push a minimal undo entry
         # (This captures typing; bulk operations push their own undo before changing)
+        # Check rules on the changed cell
+        win = self.window()
+        if hasattr(win, '_check_and_warn'):
+            win._check_and_warn([(item.row(), item.column())])
+
+    def contextMenuEvent(self, event):
+        menu = QMenu(self)
+
+        # Save Selection as Snippet
+        save_act = QAction("Save Selection as Snippet...", self)
+        save_act.triggered.connect(self._ctx_save_snippet)
+        menu.addAction(save_act)
+
+        # Insert Snippet submenu
+        snippets = list_snippets()
+        if snippets:
+            sub = menu.addMenu("Insert Snippet")
+            for name in snippets:
+                act = QAction(name, self)
+                act.triggered.connect(lambda checked, n=name: self._ctx_insert_snippet(n))
+                sub.addAction(act)
+
+        # Manage Snippets
+        manage_act = QAction("Manage Snippets...", self)
+        manage_act.triggered.connect(self._ctx_manage_snippets)
+        menu.addAction(manage_act)
+
+        menu.exec(event.globalPos())
+
+    def _ctx_save_snippet(self):
+        win = self.window()
+        rng = win._selected_range()
+        if rng is None:
+            QMessageBox.information(self, "Snippet", "Select a range of cells first.")
+            return
+        r1, c1, r2, c2 = rng
+        name, ok = QInputDialog.getText(self, "Save Snippet", "Snippet name:")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        dest = SNIPPETS_DIR / f"{name}.xlsx"
+        if dest.exists():
+            reply = QMessageBox.question(
+                self, "Overwrite Snippet",
+                f'Snippet "{name}" already exists. Overwrite?',
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+        save_snippet(name, self, r1, c1, r2, c2)
+        win.statusBar().showMessage(f"Saved snippet: {name}")
+
+    def _ctx_insert_snippet(self, name):
+        row = self.currentRow()
+        col = self.currentColumn()
+        insert_snippet(name, self, row, col)
+        self.window().statusBar().showMessage(f"Inserted snippet: {name}")
+
+    def _ctx_manage_snippets(self):
+        snippets = list_snippets()
+        if not snippets:
+            QMessageBox.information(self, "Snippets", "No snippets saved yet.")
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Manage Snippets")
+        dlg.setMinimumSize(300, 250)
+        layout = QVBoxLayout(dlg)
+        lw = QListWidget()
+        for s in snippets:
+            lw.addItem(s)
+        layout.addWidget(lw)
+        del_btn = QPushButton("Delete Selected")
+        def _delete():
+            item = lw.currentItem()
+            if item:
+                delete_snippet(item.text())
+                lw.takeItem(lw.row(item))
+        del_btn.clicked.connect(_delete)
+        layout.addWidget(del_btn)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dlg.accept)
+        layout.addWidget(close_btn)
+        dlg.exec()
 
     def _load(self):
         ws = self.ws
@@ -466,61 +824,7 @@ class SheetView(QTableWidget):
         for ri in range(rows):
             for ci in range(cols):
                 cell = ws.cell(row=ri + 1, column=ci + 1)
-                item = QTableWidgetItem()
-
-                # Value
-                val = cell.value
-                if val is not None:
-                    item.setText(str(val))
-
-                # Font
-                qf = QFont()
-                if cell.font:
-                    qf.setFamily(cell.font.name or "Arial")
-                    qf.setPointSize(cell.font.size or 11)
-                    qf.setBold(cell.font.bold or False)
-                    qf.setItalic(cell.font.italic or False)
-                    qf.setUnderline(
-                        cell.font.underline is not None
-                        and cell.font.underline != "none"
-                    )
-                    fc = xl_color_to_qcolor(cell.font.color, QColor("#202124"))
-                    item.setForeground(QBrush(fc if fc else QColor("#202124")))
-                else:
-                    item.setForeground(QBrush(QColor("#202124")))
-                item.setFont(qf)
-
-                # Fill
-                has_fill = False
-                if cell.fill and cell.fill.fgColor:
-                    bg = xl_color_to_qcolor(cell.fill.fgColor)
-                    if bg and bg.isValid() and bg != QColor(0, 0, 0):
-                        item.setBackground(QBrush(bg))
-                        has_fill = True
-                if not has_fill:
-                    item.setBackground(QBrush(QColor("#FFFFFF")))
-
-                # Alignment
-                flags = Qt.AlignLeft | Qt.AlignVCenter
-                if cell.alignment:
-                    h = HALIGN_MAP.get(cell.alignment.horizontal, Qt.AlignLeft)
-                    v = VALIGN_MAP.get(cell.alignment.vertical, Qt.AlignVCenter)
-                    flags = h | v
-                    if cell.alignment.wrap_text:
-                        flags |= Qt.TextWordWrap
-                item.setTextAlignment(flags)
-
-                # Borders
-                if cell.border:
-                    bd = {}
-                    for side_name in ("top", "bottom", "left", "right"):
-                        side = getattr(cell.border, side_name, None)
-                        pen_info = _side_to_pen(side)
-                        if pen_info:
-                            bd[side_name] = pen_info
-                    if bd:
-                        item.setData(BORDER_ROLE, bd)
-
+                item = _xl_cell_to_item(cell)
                 self.setItem(ri, ci, item)
 
         # Merged cells
@@ -544,81 +848,7 @@ class SheetView(QTableWidget):
             for ci in range(self.columnCount()):
                 cell = ws.cell(row=ri + 1, column=ci + 1)
                 item = self.item(ri, ci)
-                if item is None:
-                    cell.value = None
-                    continue
-
-                cell.value = item.text() or None
-
-                # Font
-                qf = item.font()
-                fg_brush = item.foreground()
-                fg_color = (
-                    fg_brush.color()
-                    if fg_brush != QBrush()
-                    else QColor("#202124")
-                )
-                cell.font = XlFont(
-                    name=qf.family(),
-                    size=qf.pointSize(),
-                    bold=qf.bold(),
-                    italic=qf.italic(),
-                    underline="single" if qf.underline() else None,
-                    color=qcolor_to_xl_rgb(fg_color),
-                )
-
-                # Fill
-                bg_brush = item.background()
-                if bg_brush != QBrush() and bg_brush.color().isValid():
-                    bgc = bg_brush.color()
-                    if bgc != QColor("#FFFFFF"):
-                        cell.fill = PatternFill(
-                            start_color=qcolor_to_xl_rgb(bgc),
-                            end_color=qcolor_to_xl_rgb(bgc),
-                            fill_type="solid",
-                        )
-                    else:
-                        cell.fill = PatternFill(fill_type=None)
-                else:
-                    cell.fill = PatternFill(fill_type=None)
-
-                # Alignment
-                flags = item.textAlignment()
-                ha = "left"
-                if flags & Qt.AlignHCenter:
-                    ha = "center"
-                elif flags & Qt.AlignRight:
-                    ha = "right"
-                va = "center"
-                if flags & Qt.AlignTop:
-                    va = "top"
-                elif flags & Qt.AlignBottom:
-                    va = "bottom"
-                wrap = bool(flags & Qt.TextWordWrap)
-                cell.alignment = Alignment(
-                    horizontal=ha, vertical=va, wrap_text=wrap
-                )
-
-                # Borders
-                bd = item.data(BORDER_ROLE)
-                if bd:
-                    sides = {}
-                    for side_name in ("top", "bottom", "left", "right"):
-                        info = bd.get(side_name)
-                        if info:
-                            color_hex, width, _ = info
-                            style = "thin"
-                            if width >= 3:
-                                style = "thick"
-                            elif width >= 2:
-                                style = "medium"
-                            sides[side_name] = Side(
-                                style=style,
-                                color=qcolor_to_xl_rgb(QColor(color_hex)),
-                            )
-                        else:
-                            sides[side_name] = Side(style=None)
-                    cell.border = Border(**sides)
+                _item_to_xl_cell(item, cell)
 
         # Re-merge
         for r1, c1, r2, c2 in self.merges:
@@ -651,6 +881,7 @@ class TemplatePicker(QDialog):
         self.setWindowTitle("New from Template")
         self.setMinimumSize(500, 400)
         self.chosen_wb = None
+        self._chosen_path = None
 
         layout = QVBoxLayout(self)
 
@@ -724,6 +955,7 @@ class TemplatePicker(QDialog):
         if path and Path(path).exists():
             try:
                 self.chosen_wb = openpyxl.load_workbook(path)
+                self._chosen_path = path
                 self.accept()
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to load template:\n{e}")
@@ -749,6 +981,154 @@ class TemplatePicker(QDialog):
                 QMessageBox.critical(self, "Error", f"Failed to delete:\n{e}")
 
 
+# ── Rules Editor Dialog ──────────────────────────────────────────────────────
+
+RULE_TYPES = [
+    "not_empty", "number_only", "max_length", "font_size_min",
+    "font_size_max", "wrap_required", "fill_required", "row_height",
+]
+
+RULE_PARAMS = {
+    "max_length": "max_length",
+    "font_size_min": "min_size",
+    "font_size_max": "max_size",
+    "row_height": "height",
+}
+
+
+class RulesEditor(QDialog):
+    def __init__(self, rules, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Edit Rules")
+        self.setMinimumSize(600, 450)
+        self._rules = [dict(r) for r in rules]  # deep-ish copy
+        for entry in self._rules:
+            entry["rules"] = [dict(c) for c in entry.get("rules", [])]
+
+        layout = QHBoxLayout(self)
+
+        # Left: entry list
+        left = QVBoxLayout()
+        left.addWidget(QLabel("Rule Entries"))
+        self.entry_list = QListWidget()
+        self.entry_list.currentRowChanged.connect(self._show_entry)
+        left.addWidget(self.entry_list)
+        btn_row = QHBoxLayout()
+        add_entry = QPushButton("Add Entry")
+        add_entry.clicked.connect(self._add_entry)
+        btn_row.addWidget(add_entry)
+        del_entry = QPushButton("Remove Entry")
+        del_entry.clicked.connect(self._del_entry)
+        btn_row.addWidget(del_entry)
+        left.addLayout(btn_row)
+        layout.addLayout(left)
+
+        # Right: entry detail
+        right = QVBoxLayout()
+        right.addWidget(QLabel("Range (e.g. A1:D10):"))
+        self.range_edit = QLineEdit()
+        self.range_edit.textChanged.connect(self._update_range)
+        right.addWidget(self.range_edit)
+
+        right.addWidget(QLabel("Conditions"))
+        self.cond_list = QListWidget()
+        right.addWidget(self.cond_list)
+
+        cond_btn_row = QHBoxLayout()
+        add_cond = QPushButton("Add Condition")
+        add_cond.clicked.connect(self._add_cond)
+        cond_btn_row.addWidget(add_cond)
+        del_cond = QPushButton("Remove Condition")
+        del_cond.clicked.connect(self._del_cond)
+        cond_btn_row.addWidget(del_cond)
+        right.addLayout(cond_btn_row)
+
+        right.addStretch()
+
+        ok_btn = QPushButton("OK")
+        ok_btn.setDefault(True)
+        ok_btn.clicked.connect(self.accept)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        bottom = QHBoxLayout()
+        bottom.addStretch()
+        bottom.addWidget(ok_btn)
+        bottom.addWidget(cancel_btn)
+        right.addLayout(bottom)
+        layout.addLayout(right)
+
+        self._refresh_entries()
+
+    def _refresh_entries(self):
+        self.entry_list.clear()
+        for entry in self._rules:
+            self.entry_list.addItem(entry.get("range", "???"))
+
+    def _show_entry(self, row):
+        self.cond_list.clear()
+        self.range_edit.blockSignals(True)
+        if 0 <= row < len(self._rules):
+            entry = self._rules[row]
+            self.range_edit.setText(entry.get("range", ""))
+            for cond in entry.get("rules", []):
+                label = cond.get("type", "")
+                param_key = RULE_PARAMS.get(label)
+                if param_key and param_key in cond:
+                    label += f" ({cond[param_key]})"
+                self.cond_list.addItem(label)
+        else:
+            self.range_edit.setText("")
+        self.range_edit.blockSignals(False)
+
+    def _update_range(self, text):
+        row = self.entry_list.currentRow()
+        if 0 <= row < len(self._rules):
+            self._rules[row]["range"] = text
+            self.entry_list.currentItem().setText(text)
+
+    def _add_entry(self):
+        self._rules.append({"range": "A1:A1", "rules": []})
+        self._refresh_entries()
+        self.entry_list.setCurrentRow(len(self._rules) - 1)
+
+    def _del_entry(self):
+        row = self.entry_list.currentRow()
+        if 0 <= row < len(self._rules):
+            self._rules.pop(row)
+            self._refresh_entries()
+
+    def _add_cond(self):
+        row = self.entry_list.currentRow()
+        if row < 0 or row >= len(self._rules):
+            return
+        rtype, ok = QInputDialog.getItem(
+            self, "Add Condition", "Rule type:", RULE_TYPES, 0, False,
+        )
+        if not ok:
+            return
+        cond = {"type": rtype}
+        param_key = RULE_PARAMS.get(rtype)
+        if param_key:
+            val, ok2 = QInputDialog.getInt(self, "Parameter", f"{param_key}:", 10, 0, 99999)
+            if not ok2:
+                return
+            cond[param_key] = val
+        self._rules[row]["rules"].append(cond)
+        self._show_entry(row)
+
+    def _del_cond(self):
+        entry_row = self.entry_list.currentRow()
+        cond_row = self.cond_list.currentRow()
+        if 0 <= entry_row < len(self._rules):
+            conds = self._rules[entry_row].get("rules", [])
+            if 0 <= cond_row < len(conds):
+                conds.pop(cond_row)
+                self._show_entry(entry_row)
+
+    def get_rules(self):
+        return self._rules
+
+
 # ── Main Window ──────────────────────────────────────────────────────────────
 
 class SheetEditWindow(QMainWindow):
@@ -758,6 +1138,7 @@ class SheetEditWindow(QMainWindow):
         self.resize(1200, 800)
         self.wb = None
         self.filepath = None
+        self.rules = []
 
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
@@ -850,6 +1231,31 @@ class SheetEditWindow(QMainWindow):
         del_col = QAction("Delete Column", self)
         del_col.triggered.connect(self.cmd_delete_col)
         edit_menu.addAction(del_col)
+
+        edit_menu.addSeparator()
+
+        save_snippet_act = QAction("Save Selection as Snippet...", self)
+        save_snippet_act.triggered.connect(self._menu_save_snippet)
+        edit_menu.addAction(save_snippet_act)
+
+        self._insert_snippet_menu = QMenu("Insert Snippet", self)
+        self._insert_snippet_menu.aboutToShow.connect(self._populate_snippet_menu)
+        edit_menu.addMenu(self._insert_snippet_menu)
+
+        # ── Rules menu ──
+        rules_menu = mb.addMenu("Rules")
+
+        edit_rules_act = QAction("Edit Rules...", self)
+        edit_rules_act.triggered.connect(self._edit_rules)
+        rules_menu.addAction(edit_rules_act)
+
+        check_rules_act = QAction("Check All Rules Now", self)
+        check_rules_act.triggered.connect(self._check_all_rules)
+        rules_menu.addAction(check_rules_act)
+
+        clear_rules_act = QAction("Clear All Rules", self)
+        clear_rules_act.triggered.connect(self._clear_all_rules)
+        rules_menu.addAction(clear_rules_act)
 
     # ── Toolbar ──────────────────────────────────────────────────────────
 
@@ -981,6 +1387,7 @@ class SheetEditWindow(QMainWindow):
     def _new_workbook(self):
         self.wb = openpyxl.Workbook()
         self.filepath = None
+        self.rules = []
         self.setWindowTitle("SheetEdit — New Workbook")
         self._reload_tabs()
 
@@ -989,8 +1396,18 @@ class SheetEditWindow(QMainWindow):
         if dlg.exec() == QDialog.Accepted and dlg.chosen_wb:
             self.wb = dlg.chosen_wb
             self.filepath = None
+            self.rules = []
+            # Check for companion rules in templates dir
+            if hasattr(dlg, '_chosen_path') and dlg._chosen_path:
+                rp = Path(dlg._chosen_path).with_suffix('.rules.json')
+                if rp.exists():
+                    try:
+                        self.rules = json.loads(rp.read_text())
+                    except Exception:
+                        pass
             self.setWindowTitle("SheetEdit — New from Template")
             self._reload_tabs()
+            self._apply_rule_markers()
             self.statusBar().showMessage("Created from template")
 
     def _save_as_template(self):
@@ -1014,6 +1431,12 @@ class SheetEditWindow(QMainWindow):
             for i in range(self.tabs.count()):
                 self.tabs.widget(i).sync_to_ws()
             self.wb.save(str(dest))
+            # Save companion rules if any
+            rules_dest = dest.with_suffix('.rules.json')
+            if self.rules:
+                rules_dest.write_text(json.dumps(self.rules, indent=2))
+            elif rules_dest.exists():
+                rules_dest.unlink()
             self.statusBar().showMessage(f"Saved template: {name}")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save template:\n{e}")
@@ -1029,8 +1452,16 @@ class SheetEditWindow(QMainWindow):
         try:
             self.wb = openpyxl.load_workbook(path)
             self.filepath = path
+            self.rules = []
+            rp = self._rules_path()
+            if rp and rp.exists():
+                try:
+                    self.rules = json.loads(rp.read_text())
+                except Exception:
+                    pass
             self.setWindowTitle(f"SheetEdit \u2014 {Path(path).name}")
             self._reload_tabs()
+            self._apply_rule_markers()
             self.statusBar().showMessage(f"Opened {Path(path).name}")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to open file:\n{e}")
@@ -1063,10 +1494,188 @@ class SheetEditWindow(QMainWindow):
                 sv = self.tabs.widget(i)
                 sv.sync_to_ws()
             self.wb.save(path)
+            # Save/remove rules sidecar
+            rp = self._rules_path()
+            if rp:
+                if self.rules:
+                    rp.write_text(json.dumps(self.rules, indent=2))
+                elif rp.exists():
+                    rp.unlink()
             self.setWindowTitle(f"SheetEdit \u2014 {Path(path).name}")
             self.statusBar().showMessage(f"Saved to {Path(path).name}")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save:\n{e}")
+
+    # ── Rules helpers ────────────────────────────────────────────────────
+
+    def _rules_path(self):
+        """Return the .rules.json sidecar path for the current file."""
+        if not self.filepath:
+            return None
+        return Path(self.filepath).with_suffix('.rules.json')
+
+    def _apply_rule_markers(self):
+        """Mark cells that are in ruled ranges with RULE_ROLE for the blue dot."""
+        sv = self._sheet()
+        if sv is None:
+            return
+        # Clear all rule markers first
+        for ri in range(sv.rowCount()):
+            for ci in range(sv.columnCount()):
+                item = sv.item(ri, ci)
+                if item:
+                    item.setData(RULE_ROLE, None)
+        # Set markers for ruled cells
+        for entry in self.rules:
+            try:
+                min_c, min_r, max_c, max_r = range_boundaries(entry["range"])
+            except Exception:
+                continue
+            for ri in range(min_r - 1, min(max_r, sv.rowCount())):
+                for ci in range(min_c - 1, min(max_c, sv.columnCount())):
+                    item = sv.item(ri, ci)
+                    if item is None:
+                        item = QTableWidgetItem()
+                        sv.setItem(ri, ci, item)
+                    item.setData(RULE_ROLE, True)
+        sv.viewport().update()
+
+    def _check_rules(self, cells):
+        """Check rules for a list of (row, col) cells. Returns list of violation strings."""
+        sv = self._sheet()
+        if sv is None or not self.rules:
+            return []
+        violations = []
+        cell_set = set(cells)
+        for entry in self.rules:
+            try:
+                min_c, min_r, max_c, max_r = range_boundaries(entry["range"])
+            except Exception:
+                continue
+            for rule in entry.get("rules", []):
+                rtype = rule.get("type", "")
+                for ri in range(min_r - 1, max_r):
+                    for ci in range(min_c - 1, max_c):
+                        if (ri, ci) not in cell_set:
+                            continue
+                        item = sv.item(ri, ci)
+                        text = item.text() if item else ""
+                        cell_ref = f"{get_column_letter(ci + 1)}{ri + 1}"
+
+                        if rtype == "not_empty" and not text.strip():
+                            violations.append(f"{cell_ref}: must not be empty")
+                        elif rtype == "number_only" and text.strip():
+                            try:
+                                float(text)
+                            except ValueError:
+                                violations.append(f"{cell_ref}: must be a number")
+                        elif rtype == "max_length":
+                            ml = rule.get("max_length", 999999)
+                            if len(text) > ml:
+                                violations.append(f"{cell_ref}: text exceeds {ml} chars")
+                        elif rtype == "font_size_min" and item:
+                            sz = item.font().pointSize()
+                            mn = rule.get("min_size", 0)
+                            if sz < mn:
+                                violations.append(f"{cell_ref}: font size {sz} < minimum {mn}")
+                        elif rtype == "font_size_max" and item:
+                            sz = item.font().pointSize()
+                            mx = rule.get("max_size", 999)
+                            if sz > mx:
+                                violations.append(f"{cell_ref}: font size {sz} > maximum {mx}")
+                        elif rtype == "wrap_required" and item:
+                            if not (item.textAlignment() & Qt.TextWordWrap):
+                                violations.append(f"{cell_ref}: wrap text required")
+                        elif rtype == "fill_required" and item:
+                            bg = item.background()
+                            if bg == QBrush() or not bg.color().isValid() or bg.color() == QColor("#FFFFFF"):
+                                violations.append(f"{cell_ref}: background fill required")
+                        elif rtype == "row_height":
+                            expected = rule.get("height", 0)
+                            actual_px = sv.rowHeight(ri)
+                            actual_pt = px_to_xl_row_height(actual_px)
+                            if abs(actual_pt - expected) > 1.0:
+                                violations.append(f"Row {ri + 1}: height {actual_pt:.0f}pt != expected {expected}pt")
+        return violations
+
+    def _check_and_warn(self, cells):
+        """Check rules for cells and warn user if violations found."""
+        violations = self._check_rules(cells)
+        if violations:
+            msg = "\n".join(violations[:20])
+            if len(violations) > 20:
+                msg += f"\n... and {len(violations) - 20} more"
+            QMessageBox.warning(self, "Rule Violations", msg)
+
+    def _check_and_warn_selection(self):
+        """Check rules for the currently selected cells."""
+        coords = self._selected_coords()
+        if coords:
+            self._check_and_warn(coords)
+
+    # ── Snippet menu actions ─────────────────────────────────────────────
+
+    def _menu_save_snippet(self):
+        sv = self._sheet()
+        if sv is None:
+            return
+        sv._ctx_save_snippet()
+
+    def _populate_snippet_menu(self):
+        self._insert_snippet_menu.clear()
+        snippets = list_snippets()
+        if not snippets:
+            act = QAction("(no snippets)", self)
+            act.setEnabled(False)
+            self._insert_snippet_menu.addAction(act)
+            return
+        sv = self._sheet()
+        for name in snippets:
+            act = QAction(name, self)
+            act.triggered.connect(lambda checked, n=name: self._menu_insert_snippet(n))
+            self._insert_snippet_menu.addAction(act)
+
+    def _menu_insert_snippet(self, name):
+        sv = self._sheet()
+        if sv is None:
+            return
+        sv._ctx_insert_snippet(name)
+
+    # ── Rules menu actions ───────────────────────────────────────────────
+
+    def _edit_rules(self):
+        dlg = RulesEditor(self.rules, self)
+        if dlg.exec() == QDialog.Accepted:
+            self.rules = dlg.get_rules()
+            self._apply_rule_markers()
+
+    def _check_all_rules(self):
+        sv = self._sheet()
+        if sv is None:
+            return
+        all_cells = [(r, c) for r in range(sv.rowCount()) for c in range(sv.columnCount())]
+        violations = self._check_rules(all_cells)
+        if violations:
+            msg = "\n".join(violations[:50])
+            if len(violations) > 50:
+                msg += f"\n... and {len(violations) - 50} more"
+            QMessageBox.warning(self, "Rule Violations", f"{len(violations)} violation(s) found:\n\n{msg}")
+        else:
+            QMessageBox.information(self, "Rules", "All rules pass.")
+
+    def _clear_all_rules(self):
+        if not self.rules:
+            QMessageBox.information(self, "Rules", "No rules to clear.")
+            return
+        reply = QMessageBox.question(
+            self, "Clear Rules",
+            f"Remove all {len(self.rules)} rule entries?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            self.rules = []
+            self._apply_rule_markers()
+            self.statusBar().showMessage("Rules cleared")
 
     # ── Print ────────────────────────────────────────────────────────────
 
@@ -1328,6 +1937,7 @@ class SheetEditWindow(QMainWindow):
             f = item.font()
             f.setBold(not f.bold())
             item.setFont(f)
+        self._check_and_warn_selection()
 
     def cmd_italic(self):
         self._push_undo_for_selection()
@@ -1335,6 +1945,7 @@ class SheetEditWindow(QMainWindow):
             f = item.font()
             f.setItalic(not f.italic())
             item.setFont(f)
+        self._check_and_warn_selection()
 
     def cmd_fill_color(self):
         color = QColorDialog.getColor(QColor(Qt.white), self, "Fill Color")
@@ -1342,6 +1953,7 @@ class SheetEditWindow(QMainWindow):
             self._push_undo_for_selection()
             for item in self._selected_items():
                 item.setBackground(QBrush(color))
+            self._check_and_warn_selection()
 
     def cmd_font_color(self):
         color = QColorDialog.getColor(QColor(Qt.black), self, "Font Color")
@@ -1349,6 +1961,7 @@ class SheetEditWindow(QMainWindow):
             self._push_undo_for_selection()
             for item in self._selected_items():
                 item.setForeground(QBrush(color))
+            self._check_and_warn_selection()
 
     def cmd_halign(self, align):
         self._push_undo_for_selection()
@@ -1357,6 +1970,7 @@ class SheetEditWindow(QMainWindow):
             cur = item.textAlignment()
             cur &= ~(Qt.AlignLeft | Qt.AlignHCenter | Qt.AlignRight)
             item.setTextAlignment(cur | flag)
+        self._check_and_warn_selection()
 
     def cmd_valign(self, align):
         self._push_undo_for_selection()
@@ -1365,12 +1979,14 @@ class SheetEditWindow(QMainWindow):
             cur = item.textAlignment()
             cur &= ~(Qt.AlignTop | Qt.AlignVCenter | Qt.AlignBottom)
             item.setTextAlignment(cur | flag)
+        self._check_and_warn_selection()
 
     def cmd_wrap(self):
         self._push_undo_for_selection()
         for item in self._selected_items():
             cur = item.textAlignment()
             item.setTextAlignment(cur ^ Qt.TextWordWrap)
+        self._check_and_warn_selection()
 
     def cmd_merge(self):
         rng = self._selected_range()
