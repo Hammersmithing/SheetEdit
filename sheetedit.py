@@ -1012,25 +1012,21 @@ class SheetView(QTableWidget):
         super().paintEvent(event)
         if not self._clip_range:
             return
-        r1, c1, r2, c2 = self._clip_range
-        # Get visual rect for the range
-        top_left = self.visualItemRect(self.item(r1, c1) or QTableWidgetItem())
-        bot_right = self.visualItemRect(self.item(r2, c2) or QTableWidgetItem())
-        # If items don't exist, use index-based rect
-        idx_tl = self.model().index(r1, c1)
-        idx_br = self.model().index(r2, c2)
-        rect_tl = self.visualRect(idx_tl)
-        rect_br = self.visualRect(idx_br)
-        if rect_tl.isNull() or rect_br.isNull():
-            return
-        rect = rect_tl.united(rect_br)
-
-        painter = QPainter(self.viewport())
-        pen = QPen(QColor("#1A73E8"), 2, Qt.DashLine)
-        pen.setDashOffset(self._march_offset)
-        painter.setPen(pen)
-        painter.drawRect(rect.adjusted(0, 0, -1, -1))
-        painter.end()
+        try:
+            r1, c1, r2, c2 = self._clip_range
+            rect_tl = self.visualRect(self.model().index(r1, c1))
+            rect_br = self.visualRect(self.model().index(r2, c2))
+            if rect_tl.isNull() or rect_br.isNull():
+                return
+            rect = rect_tl.united(rect_br)
+            painter = QPainter(self.viewport())
+            pen = QPen(QColor("#1A73E8"), 2, Qt.DashLine)
+            pen.setDashOffset(self._march_offset)
+            painter.setPen(pen)
+            painter.drawRect(rect.adjusted(0, 0, -1, -1))
+            painter.end()
+        except Exception:
+            pass
 
     def _cell_moved(self, row, col, prev_row, prev_col):
         self._editing = False
@@ -1654,7 +1650,11 @@ def _build_snippet_prompt(snippet_name):
 
 {guide_section}
 
-Return ONLY the JSON object with cell references as keys. Use "" for any field not found. No explanation.
+CRITICAL RULES:
+- Return ONLY the JSON object with cell references as keys.
+- If a field is NOT explicitly found in the source text, you MUST use "" (empty string).
+- Do NOT guess, infer, or use placeholder values. Only use data that appears in the text.
+- No explanation, no commentary.
 
 Text:
 """
@@ -3587,10 +3587,14 @@ class SheetEditWindow(QMainWindow):
         to_remove = []
         for m in sv.merges:
             if m[0] <= r2 and m[2] >= r1 and m[1] <= c2 and m[3] >= c1:
-                sv.setSpan(m[0], m[1], 1, 1)
                 to_remove.append(m)
+        if not to_remove:
+            return
+        sv.setUpdatesEnabled(False)
         for m in to_remove:
+            sv.setSpan(m[0], m[1], 1, 1)
             sv.merges.remove(m)
+        sv.setUpdatesEnabled(True)
         self.statusBar().showMessage("Unmerged")
 
     def _apply_borders(self, color_hex, width):
