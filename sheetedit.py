@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
     QLabel, QStatusBar, QMenu, QMenuBar, QSizePolicy, QStyledItemDelegate,
     QStyleOptionViewItem, QDialog, QHBoxLayout, QListWidget, QListWidgetItem,
     QPushButton, QLineEdit, QInputDialog, QGridLayout, QFrame, QPlainTextEdit,
-    QComboBox, QScrollArea,
+    QComboBox, QScrollArea, QSplitter,
 )
 from PySide6.QtPrintSupport import QPrinter, QPrintDialog, QPrintPreviewDialog
 from PySide6.QtGui import QPageLayout
@@ -24,7 +24,7 @@ from PySide6.QtGui import (
 )
 
 import openpyxl
-from openpyxl.utils import get_column_letter
+from openpyxl.utils import get_column_letter, column_index_from_string
 from openpyxl.utils.cell import range_boundaries
 from openpyxl.styles import Font as XlFont, PatternFill, Alignment, Border, Side
 
@@ -1211,6 +1211,14 @@ class SheetView(QTableWidget):
                 act.triggered.connect(lambda checked, n=name: self._ctx_insert_snippet(n))
                 sub.addAction(act)
 
+        # Edit Import Rules submenu
+        if snippets:
+            rules_sub = menu.addMenu("Edit Import Rules")
+            for name in snippets:
+                act = QAction(name, self)
+                act.triggered.connect(lambda checked, n=name: self._ctx_open_snippet_rules(n))
+                rules_sub.addAction(act)
+
         # Manage Snippets
         manage_act = QAction("Manage Snippets...", self)
         manage_act.triggered.connect(self._ctx_manage_snippets)
@@ -1272,6 +1280,14 @@ class SheetView(QTableWidget):
         close_btn.clicked.connect(dlg.accept)
         layout.addWidget(close_btn)
         dlg.exec()
+
+    def _ctx_open_snippet_rules(self, snippet_name):
+        """Open the visual snippet rules editor."""
+        dlg = SnippetRulesEditor(snippet_name, self)
+        if dlg.exec() == QDialog.Accepted:
+            win = self.window()
+            if hasattr(win, 'statusBar'):
+                win.statusBar().showMessage(f"Import rules saved for {snippet_name} — guide compiled")
 
     # Default grid size (matches Google Sheets)
     DEFAULT_ROWS = 1000
@@ -1619,6 +1635,290 @@ OLLAMA_MODEL = "llama3.3:latest"
 OLLAMA_URL = "http://localhost:11434/api/chat"
 
 CALL_SHEET_SYSTEM_PROMPT = """You are a JSON data extractor. You ONLY output valid JSON. No explanations, no markdown, no commentary. Just a single JSON object matching EXACTLY the schema provided."""
+
+
+def _snippet_guide_path(snippet_name):
+    """Return the path to a snippet's per-snippet .guide.json file."""
+    return SNIPPETS_DIR / f"{snippet_name}.guide.json"
+
+
+def _load_snippet_rules_json(snippet_name):
+    """Load a snippet's per-cell rules. Returns dict {cell_ref: rule_text, "_description": "..."}."""
+    p = _snippet_guide_path(snippet_name)
+    if p.exists():
+        try:
+            return json.loads(p.read_text())
+        except Exception:
+            pass
+    # Migrate from old .guide.md if it exists
+    old_md = SNIPPETS_DIR / f"{snippet_name}.guide.md"
+    if old_md.exists():
+        return _migrate_guide_md(snippet_name, old_md)
+    return {}
+
+
+def _migrate_guide_md(snippet_name, md_path):
+    """Convert old .guide.md to .guide.json format."""
+    text = md_path.read_text()
+    rules = {"_description": ""}
+    desc_lines = []
+    for line in text.strip().splitlines():
+        line_s = line.strip()
+        if line_s.startswith("- ") and ":" in line_s[2:6]:
+            # Parse "- A1: description"
+            rest = line_s[2:]
+            ref, _, desc = rest.partition(":")
+            ref = ref.strip()
+            rules[ref] = desc.strip()
+        else:
+            desc_lines.append(line)
+    rules["_description"] = "\n".join(desc_lines).strip()
+    # Save as JSON and remove old md
+    _save_snippet_rules_json(snippet_name, rules)
+    md_path.unlink()
+    return rules
+
+
+def _save_snippet_rules_json(snippet_name, rules):
+    """Save a snippet's per-cell rules as JSON."""
+    _ensure_snippets_dir()
+    p = _snippet_guide_path(snippet_name)
+    # Remove empty entries
+    clean = {k: v for k, v in rules.items() if v}
+    if clean:
+        p.write_text(json.dumps(clean, indent=2))
+    elif p.exists():
+        p.unlink()
+
+
+def _snippet_cell_refs(snippet_name):
+    """Read a snippet xlsx and return list of (cell_ref, value) for non-empty cells."""
+    path = SNIPPETS_DIR / f"{snippet_name}.xlsx"
+    if not path.exists():
+        return []
+    wb = openpyxl.load_workbook(str(path))
+    ws = wb.active
+    cells = []
+    for row in ws.iter_rows(min_row=1, max_row=ws.max_row, max_col=ws.max_column):
+        for c in row:
+            if c.value is not None:
+                ref = f"{get_column_letter(c.column)}{c.row}"
+                cells.append((ref, str(c.value)))
+    return cells
+
+
+def _compile_import_guide():
+    """Compile all per-snippet .guide.json files into the master import_guide.md."""
+    snippets = list_snippets()
+    sections = []
+    for name in snippets:
+        rules = _load_snippet_rules_json(name)
+        if not rules:
+            continue
+        # Only include snippets that have at least one cell rule
+        cell_rules = {k: v for k, v in rules.items() if k != "_description" and v}
+        if not cell_rules:
+            continue
+        cell_refs = _snippet_cell_refs(name)
+        lines = [f"## {name}", ""]
+        desc = rules.get("_description", "")
+        if desc:
+            lines.append(desc)
+            lines.append("")
+        # Build cell descriptions from rules
+        lines.append("Fill these cells:")
+        for ref, rule_text in cell_rules.items():
+            lines.append(f"- {ref}: {rule_text}")
+        lines.append("")
+        # Build JSON template from all non-empty cells in snippet
+        if cell_refs:
+            lines.append("Return JSON:")
+            lines.append("```json")
+            lines.append("{")
+            json_lines = [f'  "{ref}": ""' for ref, _ in cell_refs]
+            lines.append(",\n".join(json_lines))
+            lines.append("}")
+            lines.append("```")
+            lines.append("")
+        lines.append('IMPORTANT: If a field\'s data is NOT found in the source text, you MUST return "" for that field. Do NOT guess or use placeholder values. Only fill cells with data that is explicitly present in the source text.')
+        lines.append("")
+        sections.append("\n".join(lines))
+
+    header = "# Import Guide\n\nEach snippet section below tells the AI what data to extract and which cells to fill.\nWhen importing, only the active snippet's section is sent to the AI.\n\n---\n"
+    full = header + "\n".join(sections)
+    IMPORT_GUIDE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    IMPORT_GUIDE_PATH.write_text(full)
+    return full
+
+
+class SnippetRulesEditor(QDialog):
+    """Visual editor: mini spreadsheet on left, cell rule editor on right."""
+
+    def __init__(self, snippet_name, parent=None):
+        super().__init__(parent)
+        self._snippet_name = snippet_name
+        self._rules = _load_snippet_rules_json(snippet_name)
+        self._current_ref = None
+        self.setWindowTitle(f"Snippet Rules — {snippet_name}")
+        self.resize(900, 500)
+
+        main_layout = QVBoxLayout(self)
+
+        # Description at top
+        desc_row = QHBoxLayout()
+        desc_row.addWidget(QLabel("Description:"))
+        self._desc_edit = QLineEdit()
+        self._desc_edit.setPlaceholderText("Brief description of this snippet (optional)")
+        self._desc_edit.setText(self._rules.get("_description", ""))
+        desc_row.addWidget(self._desc_edit)
+        main_layout.addLayout(desc_row)
+
+        # Splitter: spreadsheet left, rule editor right
+        splitter = QSplitter(Qt.Horizontal)
+
+        # Left: mini spreadsheet
+        self._table = QTableWidget()
+        self._table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._table.setSelectionMode(QTableWidget.SingleSelection)
+        self._table.currentCellChanged.connect(self._cell_selected)
+        self._load_snippet_preview()
+        splitter.addWidget(self._table)
+
+        # Right: rule editor panel
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(8, 0, 0, 0)
+
+        self._ref_label = QLabel("Select a cell")
+        self._ref_label.setStyleSheet("font-size: 16px; font-weight: bold;")
+        right_layout.addWidget(self._ref_label)
+
+        self._val_label = QLabel("")
+        self._val_label.setStyleSheet("color: #5F6368; font-size: 12px;")
+        self._val_label.setWordWrap(True)
+        right_layout.addWidget(self._val_label)
+
+        rule_label = QLabel("Rule for this cell:")
+        right_layout.addWidget(rule_label)
+
+        self._rule_edit = QPlainTextEdit()
+        self._rule_edit.setFont(QFont("Menlo", 12))
+        self._rule_edit.setPlaceholderText(
+            "Describe what data goes here.\n"
+            "e.g. \"Production title, formatted as TITLE - CALL SHEET - X Pages\""
+        )
+        self._rule_edit.textChanged.connect(self._rule_text_changed)
+        right_layout.addWidget(self._rule_edit)
+
+        # Status: show which cells have rules
+        self._status_label = QLabel("")
+        self._status_label.setStyleSheet("color: #5F6368; font-size: 11px;")
+        self._status_label.setWordWrap(True)
+        right_layout.addWidget(self._status_label)
+
+        splitter.addWidget(right)
+        splitter.setSizes([450, 450])
+        main_layout.addWidget(splitter)
+
+        # Buttons
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        save_btn = QPushButton("Save && Compile")
+        save_btn.setStyleSheet(
+            "QPushButton { background-color: #1A73E8; color: white; "
+            "font-weight: bold; padding: 6px 20px; border-radius: 4px; }"
+            "QPushButton:hover { background-color: #1557B0; }"
+        )
+        save_btn.clicked.connect(self._save)
+        btn_row.addWidget(save_btn)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(cancel_btn)
+        main_layout.addLayout(btn_row)
+
+        self._update_status()
+
+    def _load_snippet_preview(self):
+        """Load the snippet xlsx into the mini spreadsheet."""
+        path = SNIPPETS_DIR / f"{self._snippet_name}.xlsx"
+        if not path.exists():
+            return
+        wb = openpyxl.load_workbook(str(path))
+        ws = wb.active
+        rows = ws.max_row or 1
+        cols = ws.max_column or 1
+        self._table.setRowCount(rows)
+        self._table.setColumnCount(cols)
+        self._table.setHorizontalHeaderLabels(
+            [get_column_letter(c + 1) for c in range(cols)]
+        )
+        for row in ws.iter_rows(min_row=1, max_row=rows, max_col=cols):
+            for cell in row:
+                r, c = cell.row - 1, cell.column - 1
+                item = _xl_cell_to_item(cell)
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                ref = f"{get_column_letter(cell.column)}{cell.row}"
+                # Highlight cells that have rules
+                if ref in self._rules and self._rules[ref]:
+                    item.setBackground(QBrush(QColor("#E8F0FE")))
+                self._table.setItem(r, c, item)
+        # Column widths
+        for ci in range(cols):
+            col_letter = get_column_letter(ci + 1)
+            if col_letter in ws.column_dimensions:
+                w = ws.column_dimensions[col_letter].width
+                if w:
+                    self._table.setColumnWidth(ci, xl_col_width_to_px(w))
+        # Row heights
+        for ri in range(rows):
+            if (ri + 1) in ws.row_dimensions:
+                h = ws.row_dimensions[ri + 1].height
+                if h:
+                    self._table.setRowHeight(ri, int(h * 1.33))
+        # Merges
+        for mg in ws.merged_cells.ranges:
+            r1, c1, r2, c2 = mg.min_row - 1, mg.min_col - 1, mg.max_row - 1, mg.max_col - 1
+            self._table.setSpan(r1, c1, r2 - r1 + 1, c2 - c1 + 1)
+
+    def _cell_selected(self, row, col, prev_row, prev_col):
+        """Update right panel when a cell is clicked."""
+        ref = f"{get_column_letter(col + 1)}{row + 1}"
+        self._current_ref = ref
+        self._ref_label.setText(ref)
+        item = self._table.item(row, col)
+        val = item.text() if item else ""
+        self._val_label.setText(f"Current value: {val}" if val else "(empty cell)")
+        # Load existing rule
+        self._rule_edit.blockSignals(True)
+        self._rule_edit.setPlainText(self._rules.get(ref, ""))
+        self._rule_edit.blockSignals(False)
+
+    def _rule_text_changed(self):
+        """Save rule text back to dict as user types."""
+        if not self._current_ref:
+            return
+        self._rules[self._current_ref] = self._rule_edit.toPlainText()
+        # Update cell highlight
+        ref = self._current_ref
+        col_idx = column_index_from_string(ref.rstrip("0123456789")) - 1
+        row_idx = int(ref.lstrip("ABCDEFGHIJKLMNOPQRSTUVWXYZ")) - 1
+        item = self._table.item(row_idx, col_idx)
+        if item:
+            if self._rule_edit.toPlainText().strip():
+                item.setBackground(QBrush(QColor("#E8F0FE")))
+            else:
+                item.setBackground(QBrush(QColor("#FFFFFF")))
+        self._update_status()
+
+    def _update_status(self):
+        count = sum(1 for k, v in self._rules.items() if k != "_description" and v)
+        self._status_label.setText(f"{count} cell(s) have rules defined")
+
+    def _save(self):
+        self._rules["_description"] = self._desc_edit.text().strip()
+        _save_snippet_rules_json(self._snippet_name, self._rules)
+        _compile_import_guide()
+        self.accept()
 
 
 def _get_snippet_guide(snippet_name):
@@ -2554,6 +2854,10 @@ class SheetEditWindow(QMainWindow):
         guide_act.triggered.connect(self._edit_import_guide)
         file_menu.addAction(guide_act)
 
+        self._rules_menu = QMenu("Edit Snippet Rules", self)
+        self._rules_menu.aboutToShow.connect(self._populate_snippet_rules_menu)
+        file_menu.addMenu(self._rules_menu)
+
         file_menu.addSeparator()
 
         preview_act = QAction("Print...", self)
@@ -2758,9 +3062,35 @@ class SheetEditWindow(QMainWindow):
         text_act.triggered.connect(self.cmd_force_text)
         tb.addAction(text_act)
 
+        tb.addSeparator()
+
+        # Snippet Rules
+        rules_act = QAction("Snippet Rules", self)
+        rules_act.setToolTip("Edit import rules for a snippet")
+        rules_act.triggered.connect(self._open_snippet_rules_picker)
+        tb.addAction(rules_act)
+
     # ── File I/O ─────────────────────────────────────────────────────────
 
+    def _check_unsaved(self):
+        """If there are unsaved changes, prompt the user. Returns True if safe to proceed."""
+        if not self._dirty:
+            return True
+        reply = QMessageBox.question(
+            self, "Unsaved Changes",
+            "You have unsaved changes. Save before continuing?",
+            QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+        )
+        if reply == QMessageBox.Save:
+            self._save()
+            return True
+        elif reply == QMessageBox.Discard:
+            return True
+        return False
+
     def _new_workbook(self):
+        if not self._check_unsaved():
+            return
         self.wb = openpyxl.Workbook()
         self.filepath = None
         self.rules = []
@@ -2769,6 +3099,8 @@ class SheetEditWindow(QMainWindow):
         self._reload_tabs()
 
     def _new_from_template(self):
+        if not self._check_unsaved():
+            return
         dlg = TemplatePicker(self)
         if dlg.exec() == QDialog.Accepted and dlg.chosen_wb:
             self.wb = dlg.chosen_wb
@@ -2839,6 +3171,46 @@ class SheetEditWindow(QMainWindow):
             self.setWindowTitle("SheetEdit — Composed Document")
             self._reload_tabs()
             self.statusBar().showMessage("Built document from snippets")
+
+    def _populate_snippet_rules_menu(self):
+        self._rules_menu.clear()
+        snippets = list_snippets()
+        if not snippets:
+            act = QAction("(no snippets)", self)
+            act.setEnabled(False)
+            self._rules_menu.addAction(act)
+            return
+        for name in snippets:
+            act = QAction(name, self)
+            has_rules = _snippet_guide_path(name).exists()
+            if has_rules:
+                act.setText(f"{name}  ✓")
+            act.triggered.connect(lambda checked, n=name: self._open_snippet_rules(n))
+            self._rules_menu.addAction(act)
+        self._rules_menu.addSeparator()
+        compile_act = QAction("Compile All Rules Now", self)
+        compile_act.triggered.connect(self._compile_all_rules)
+        self._rules_menu.addAction(compile_act)
+
+    def _open_snippet_rules_picker(self):
+        snippets = list_snippets()
+        if not snippets:
+            QMessageBox.information(self, "Snippet Rules", "No snippets saved yet.")
+            return
+        name, ok = QInputDialog.getItem(
+            self, "Snippet Rules", "Choose a snippet:", snippets, 0, False
+        )
+        if ok and name:
+            self._open_snippet_rules(name)
+
+    def _open_snippet_rules(self, snippet_name):
+        dlg = SnippetRulesEditor(snippet_name, self)
+        if dlg.exec() == QDialog.Accepted:
+            self.statusBar().showMessage(f"Import rules saved for {snippet_name} — guide compiled")
+
+    def _compile_all_rules(self):
+        _compile_import_guide()
+        self.statusBar().showMessage("Import guide compiled from all snippet rules")
 
     def _edit_import_guide(self):
         dlg = QDialog(self)
@@ -2911,6 +3283,8 @@ class SheetEditWindow(QMainWindow):
         self._import_call_sheet(files)
 
     def _open_dialog(self):
+        if not self._check_unsaved():
+            return
         path, _ = QFileDialog.getOpenFileName(
             self, "Open Spreadsheet", "", "Excel Files (*.xlsx);;All Files (*)"
         )
@@ -3017,21 +3391,10 @@ class SheetEditWindow(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to save:\n{e}")
 
     def closeEvent(self, event):
-        if self._dirty:
-            reply = QMessageBox.question(
-                self, "Unsaved Changes",
-                "You have unsaved changes. Save before quitting?",
-                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
-            )
-            if reply == QMessageBox.Save:
-                self._save()
-                event.accept()
-            elif reply == QMessageBox.Discard:
-                event.accept()
-            else:
-                event.ignore()
-        else:
+        if self._check_unsaved():
             event.accept()
+        else:
+            event.ignore()
 
     # ── Rules helpers ────────────────────────────────────────────────────
 
