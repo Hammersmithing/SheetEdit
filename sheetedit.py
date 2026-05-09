@@ -3590,10 +3590,14 @@ class SheetEditWindow(QMainWindow):
                 to_remove.append(m)
         if not to_remove:
             return
-        sv.setUpdatesEnabled(False)
+        # Remove from our list
         for m in to_remove:
-            sv.setSpan(m[0], m[1], 1, 1)
             sv.merges.remove(m)
+        # Clear ALL spans at once (safe single Qt call), then re-apply survivors
+        sv.setUpdatesEnabled(False)
+        sv.clearSpans()
+        for m in sv.merges:
+            sv.setSpan(m[0], m[1], m[2] - m[0] + 1, m[3] - m[1] + 1)
         sv.setUpdatesEnabled(True)
         self.statusBar().showMessage("Unmerged")
 
@@ -3667,7 +3671,21 @@ class SheetEditWindow(QMainWindow):
         if sv is None:
             return
         row = sv.currentRow()
+        # Clear existing spans before insert so Qt doesn't reference stale data
+        sv.setUpdatesEnabled(False)
+        for m in sv.merges:
+            sv.setSpan(m[0], m[1], 1, 1)
         sv.insertRow(row)
+        # Shift merges below insertion point
+        sv.merges = [
+            (r1 + (1 if r1 >= row else 0), c1, r2 + (1 if r2 >= row else 0), c2)
+            for r1, c1, r2, c2 in sv.merges
+        ]
+        # Re-apply adjusted merges
+        for r1, c1, r2, c2 in sv.merges:
+            if r2 > r1 or c2 > c1:
+                sv.setSpan(r1, c1, r2 - r1 + 1, c2 - c1 + 1)
+        sv.setUpdatesEnabled(True)
         self.statusBar().showMessage(f"Inserted row at {row + 1}")
 
     def cmd_delete_row(self):
@@ -3675,7 +3693,24 @@ class SheetEditWindow(QMainWindow):
         if sv is None:
             return
         row = sv.currentRow()
+        # Clean up merges that overlap this row
+        sv.setUpdatesEnabled(False)
+        to_remove = [m for m in sv.merges if m[0] <= row <= m[2]]
+        for m in to_remove:
+            sv.setSpan(m[0], m[1], 1, 1)
+            sv.merges.remove(m)
+        # Shift remaining merges above deleted row
+        sv.merges = [
+            (r1 - (1 if r1 > row else 0), c1, r2 - (1 if r2 > row else 0), c2)
+            for r1, c1, r2, c2 in sv.merges
+            if not (r1 > row and r2 < row)  # shouldn't happen, but guard
+        ]
         sv.removeRow(row)
+        # Re-apply adjusted merges
+        for r1, c1, r2, c2 in sv.merges:
+            if r2 > r1 or c2 > c1:
+                sv.setSpan(r1, c1, r2 - r1 + 1, c2 - c1 + 1)
+        sv.setUpdatesEnabled(True)
         self.statusBar().showMessage(f"Deleted row {row + 1}")
 
     def cmd_insert_col(self):
@@ -3683,7 +3718,21 @@ class SheetEditWindow(QMainWindow):
         if sv is None:
             return
         col = sv.currentColumn()
+        # Clear existing spans before insert so Qt doesn't reference stale data
+        sv.setUpdatesEnabled(False)
+        for m in sv.merges:
+            sv.setSpan(m[0], m[1], 1, 1)
         sv.insertColumn(col)
+        # Shift merges past insertion point
+        sv.merges = [
+            (r1, c1 + (1 if c1 >= col else 0), r2, c2 + (1 if c2 >= col else 0))
+            for r1, c1, r2, c2 in sv.merges
+        ]
+        # Re-apply adjusted merges
+        for r1, c1, r2, c2 in sv.merges:
+            if r2 > r1 or c2 > c1:
+                sv.setSpan(r1, c1, r2 - r1 + 1, c2 - c1 + 1)
+        sv.setUpdatesEnabled(True)
         self.statusBar().showMessage(
             f"Inserted column at {get_column_letter(col + 1)}"
         )
@@ -3693,7 +3742,23 @@ class SheetEditWindow(QMainWindow):
         if sv is None:
             return
         col = sv.currentColumn()
+        # Clean up merges that overlap this column
+        sv.setUpdatesEnabled(False)
+        to_remove = [m for m in sv.merges if m[1] <= col <= m[3]]
+        for m in to_remove:
+            sv.setSpan(m[0], m[1], 1, 1)
+            sv.merges.remove(m)
+        # Shift remaining merges past deleted column
+        sv.merges = [
+            (r1, c1 - (1 if c1 > col else 0), r2, c2 - (1 if c2 > col else 0))
+            for r1, c1, r2, c2 in sv.merges
+        ]
         sv.removeColumn(col)
+        # Re-apply adjusted merges
+        for r1, c1, r2, c2 in sv.merges:
+            if r2 > r1 or c2 > c1:
+                sv.setSpan(r1, c1, r2 - r1 + 1, c2 - c1 + 1)
+        sv.setUpdatesEnabled(True)
         self.statusBar().showMessage(
             f"Deleted column {get_column_letter(col + 1)}"
         )
