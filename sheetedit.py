@@ -819,6 +819,12 @@ class SheetView(QTableWidget):
         # double-click or F2 for inline editor
         self.setEditTriggers(QTableWidget.DoubleClicked)
         self._editing = False  # True when user is typing into a cell
+        # Clipboard state for copy/cut with marching ants
+        self._clip_cells = []  # list of (row, col, snapshot_data)
+        self._clip_mode = None  # "copy" or "cut"
+        self._clip_range = None  # (r1, c1, r2, c2) for drawing border
+        self._march_timer = None  # timer for marching ants animation
+        self._march_offset = 0
         self._load()
         self.itemChanged.connect(self._on_item_changed)
         self.currentCellChanged.connect(self._cell_moved)
@@ -847,22 +853,26 @@ class SheetView(QTableWidget):
         self._tracking_edits = False
         for (r, c), data in snap.items():
             if data is None:
-                if self.item(r, c):
-                    self.item(r, c).setText("")
+                # Cell didn't exist before — clear it fully
+                item = self.item(r, c)
+                if item:
+                    item.setText("")
+                    item.setForeground(QBrush(QColor("#202124")))
+                    item.setBackground(QBrush(QColor("#FFFFFF")))
+                    item.setFont(QFont("Arial", 11))
+                    item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+                    item.setData(BORDER_ROLE, None)
                 continue
             item = self.item(r, c)
             if not item:
                 item = QTableWidgetItem()
                 self.setItem(r, c, item)
             item.setText(data["text"])
-            if data["fg"]:
-                item.setForeground(QBrush(data["fg"]))
-            if data["bg"]:
-                item.setBackground(QBrush(data["bg"]))
+            item.setForeground(QBrush(data["fg"]) if data["fg"] else QBrush(QColor("#202124")))
+            item.setBackground(QBrush(data["bg"]) if data["bg"] else QBrush(QColor("#FFFFFF")))
             item.setFont(data["font"])
             item.setTextAlignment(data["align"])
-            if data["border"]:
-                item.setData(BORDER_ROLE, data["border"])
+            item.setData(BORDER_ROLE, data["border"])
         self._tracking_edits = True
 
     def push_undo(self, cells):
@@ -892,6 +902,135 @@ class SheetView(QTableWidget):
         current = self._snapshot_cells(new_snap.keys())
         self._undo_stack.append(current)
         self._restore_snapshot(new_snap)
+
+    def copy_cells(self):
+        """Copy selected cells to internal clipboard."""
+        sel = self.selectedRanges()
+        if not sel:
+            return
+        r = sel[0]
+        self._clip_cells = []
+        for ri in range(r.topRow(), r.bottomRow() + 1):
+            for ci in range(r.leftColumn(), r.rightColumn() + 1):
+                snap = self._snapshot_cells([(ri, ci)])
+                self._clip_cells.append((ri - r.topRow(), ci - r.leftColumn(), snap.get((ri, ci))))
+        self._clip_mode = "copy"
+        self._clip_range = (r.topRow(), r.leftColumn(), r.bottomRow(), r.rightColumn())
+        self._start_marching_ants()
+
+    def cut_cells(self):
+        """Cut selected cells to internal clipboard."""
+        self.copy_cells()
+        self._clip_mode = "cut"
+
+    def paste_cells(self):
+        """Paste from internal clipboard to current position."""
+        if not self._clip_cells:
+            return
+        dest_r, dest_c = self.currentRow(), self.currentColumn()
+        if dest_r < 0 or dest_c < 0:
+            return
+
+        # Collect coords for undo — include both destination AND source (if cut)
+        coords = [(dest_r + dr, dest_c + dc) for dr, dc, _ in self._clip_cells]
+        if self._clip_mode == "cut" and self._clip_range:
+            r1, c1, r2, c2 = self._clip_range
+            for ri in range(r1, r2 + 1):
+                for ci in range(c1, c2 + 1):
+                    if (ri, ci) not in coords:
+                        coords.append((ri, ci))
+        self.push_undo(coords)
+
+        self._tracking_edits = False
+        for dr, dc, data in self._clip_cells:
+            r, c = dest_r + dr, dest_c + dc
+            if r >= self.rowCount() or c >= self.columnCount():
+                continue
+            if data is None:
+                item = self.item(r, c)
+                if item:
+                    item.setText("")
+            else:
+                item = self._ensure_item(r, c)
+                item.setText(data.get("text", ""))
+                if data.get("fg"):
+                    item.setForeground(QBrush(data["fg"]))
+                if data.get("bg"):
+                    item.setBackground(QBrush(data["bg"]))
+                if data.get("font"):
+                    item.setFont(data["font"])
+                if data.get("align") is not None:
+                    item.setTextAlignment(data["align"])
+                if data.get("border"):
+                    item.setData(BORDER_ROLE, data["border"])
+        self._tracking_edits = True
+
+        # If cut, clear the source cells
+        if self._clip_mode == "cut":
+            r1, c1, r2, c2 = self._clip_range
+            self._tracking_edits = False
+            for ri in range(r1, r2 + 1):
+                for ci in range(c1, c2 + 1):
+                    item = self.item(ri, ci)
+                    if item:
+                        item.setText("")
+            self._tracking_edits = True
+            self.cancel_clip()
+        # Copy mode: keep clipboard active for multiple pastes
+
+        win = self.window()
+        if hasattr(win, '_dirty'):
+            win._dirty = True
+
+    def cancel_clip(self):
+        """Cancel the current copy/cut operation."""
+        self._clip_cells = []
+        self._clip_mode = None
+        self._clip_range = None
+        if self._march_timer:
+            self._march_timer.stop()
+            self._march_timer = None
+        self._march_offset = 0
+        self.viewport().update()
+
+    def _start_marching_ants(self):
+        """Start the marching ants animation around clipped cells."""
+        from PySide6.QtCore import QTimer
+        if self._march_timer:
+            self._march_timer.stop()
+        self._march_offset = 0
+        self._march_timer = QTimer(self)
+        self._march_timer.timeout.connect(self._march_tick)
+        self._march_timer.start(150)
+
+    def _march_tick(self):
+        self._march_offset = (self._march_offset + 1) % 8
+        self.viewport().update()
+
+    def paintEvent(self, event):
+        """Draw marching ants border around copy/cut selection."""
+        super().paintEvent(event)
+        if not self._clip_range:
+            return
+        r1, c1, r2, c2 = self._clip_range
+        # Get visual rect for the range
+        top_left = self.visualItemRect(self.item(r1, c1) or QTableWidgetItem())
+        bot_right = self.visualItemRect(self.item(r2, c2) or QTableWidgetItem())
+        # If items don't exist, use index-based rect
+        idx_tl = self.model().index(r1, c1)
+        idx_br = self.model().index(r2, c2)
+        rect_tl = self.visualRect(idx_tl)
+        rect_br = self.visualRect(idx_br)
+        if rect_tl.isNull() or rect_br.isNull():
+            return
+        rect = rect_tl.united(rect_br)
+
+        painter = QPainter(self.viewport())
+        pen = QPen(QColor("#1A73E8"), 2, Qt.DashLine)
+        pen.setDashOffset(self._march_offset)
+        painter.setPen(pen)
+        painter.drawRect(rect.adjusted(0, 0, -1, -1))
+        painter.end()
 
     def _cell_moved(self, row, col, prev_row, prev_col):
         self._editing = False
@@ -992,9 +1131,34 @@ class SheetView(QTableWidget):
                     self.setCurrentCell(row, col + 1)
             return
 
-        # Escape: stop typing mode
+        # Escape: cancel clip or stop typing mode
         if key == Qt.Key_Escape:
+            if self._clip_range:
+                self.cancel_clip()
             self._editing = False
+            return
+
+        # Cmd/Ctrl+C: copy
+        if key == Qt.Key_C and (mods & Qt.ControlModifier or mods & Qt.MetaModifier):
+            self.copy_cells()
+            return
+
+        # Cmd/Ctrl+X: cut
+        if key == Qt.Key_X and (mods & Qt.ControlModifier or mods & Qt.MetaModifier):
+            self.cut_cells()
+            return
+
+        # Cmd/Ctrl+V: paste
+        if key == Qt.Key_V and (mods & Qt.ControlModifier or mods & Qt.MetaModifier):
+            self.paste_cells()
+            return
+
+        # Cmd/Ctrl+Z: undo
+        if key == Qt.Key_Z and (mods & Qt.ControlModifier or mods & Qt.MetaModifier):
+            if mods & Qt.ShiftModifier:
+                self.redo()
+            else:
+                self.undo()
             return
 
         # F2: open Qt inline editor
@@ -2351,6 +2515,23 @@ class SheetEditWindow(QMainWindow):
 
         edit_menu.addSeparator()
 
+        cut_act = QAction("Cut", self)
+        cut_act.setShortcut(QKeySequence.Cut)
+        cut_act.triggered.connect(self.cmd_cut)
+        edit_menu.addAction(cut_act)
+
+        copy_act = QAction("Copy", self)
+        copy_act.setShortcut(QKeySequence.Copy)
+        copy_act.triggered.connect(self.cmd_copy)
+        edit_menu.addAction(copy_act)
+
+        paste_act = QAction("Paste", self)
+        paste_act.setShortcut(QKeySequence.Paste)
+        paste_act.triggered.connect(self.cmd_paste)
+        edit_menu.addAction(paste_act)
+
+        edit_menu.addSeparator()
+
         ins_row = QAction("Insert Row", self)
         ins_row.triggered.connect(self.cmd_insert_row)
         edit_menu.addAction(ins_row)
@@ -3238,6 +3419,21 @@ class SheetEditWindow(QMainWindow):
         sv = self._sheet()
         if sv:
             sv.redo()
+
+    def cmd_copy(self):
+        sv = self._sheet()
+        if sv:
+            sv.copy_cells()
+
+    def cmd_cut(self):
+        sv = self._sheet()
+        if sv:
+            sv.cut_cells()
+
+    def cmd_paste(self):
+        sv = self._sheet()
+        if sv:
+            sv.paste_cells()
 
     def _selected_range(self):
         sv = self._sheet()
