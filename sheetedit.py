@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
     QLabel, QStatusBar, QMenu, QMenuBar, QSizePolicy, QStyledItemDelegate,
     QStyleOptionViewItem, QDialog, QHBoxLayout, QListWidget, QListWidgetItem,
     QPushButton, QLineEdit, QInputDialog, QGridLayout, QFrame, QPlainTextEdit,
-    QComboBox,
+    QComboBox, QScrollArea,
 )
 from PySide6.QtPrintSupport import QPrinter, QPrintDialog, QPrintPreviewDialog
 from PySide6.QtGui import QPageLayout
@@ -1898,8 +1898,59 @@ def _import_to_snippet(snippet_name, source_text, log_fn=None):
         return None
 
     wb = openpyxl.load_workbook(str(path))
-    _fill_snippet_cells(wb, cell_data)
-    return wb
+    return wb, cell_data
+
+
+def _parse_guide_labels(snippet_name):
+    """Extract cell ref -> label mapping from the import guide."""
+    section = _get_snippet_guide(snippet_name)
+    if not section:
+        return {}
+    labels = {}
+    for line in section.split("\n"):
+        line = line.strip()
+        if line.startswith("- ") and ":" in line:
+            # Parse "- A1: Production title, formatted as ..."
+            parts = line[2:].split(":", 1)
+            ref = parts[0].strip()
+            desc = parts[1].strip() if len(parts) > 1 else ref
+            # Truncate at first parenthetical example
+            if " (e.g." in desc:
+                desc = desc[:desc.index(" (e.g.")].strip()
+            if " (e.g " in desc:
+                desc = desc[:desc.index(" (e.g ")].strip()
+            labels[ref] = desc
+    return labels
+
+
+def _prompt_missing_fields(snippet_name, cell_data, parent=None):
+    """Prompt the user one at a time for any empty fields. Returns updated cell_data."""
+    labels = _parse_guide_labels(snippet_name)
+    result = dict(cell_data)
+
+    # Find empty fields from the guide
+    missing = []
+    for ref in labels:
+        if not result.get(ref):
+            missing.append(ref)
+
+    if not missing:
+        return result
+
+    for i, ref in enumerate(missing):
+        label = labels.get(ref, ref)
+        text, ok = QInputDialog.getText(
+            parent,
+            f"Missing field ({i + 1}/{len(missing)})",
+            f"{ref} — {label}:",
+        )
+        if not ok:
+            # User cancelled — stop prompting, keep what we have
+            break
+        if text:
+            result[ref] = text
+
+    return result
 
 
 def _fill_call_sheet(data):
@@ -2276,13 +2327,22 @@ class ImportCallSheetDialog(QDialog):
         self.status_label.setText(f"Step 2/2: Filling '{snippet_name}' with {OLLAMA_MODEL}...")
         QApplication.processEvents()
 
-        wb = _import_to_snippet(snippet_name, combined, log_fn=self._log)
+        result = _import_to_snippet(snippet_name, combined, log_fn=self._log)
 
-        if wb is None:
+        if result is None:
             self.status_label.setText("Import failed.")
             return
 
+        wb, cell_data = result
+
+        # Step 3: Prompt for missing fields one at a time
+        final_data = _prompt_missing_fields(snippet_name, cell_data, self)
+        _fill_snippet_cells(wb, final_data)
+
         self.result_wb = wb
+        filled = sum(1 for v in final_data.values() if v)
+        total = len(final_data)
+        self._log(f"Filled {filled}/{total} fields")
         self.status_label.setText("Import complete!")
         self.cancel_btn.setText("Done")
         self.cancel_btn.clicked.disconnect()
