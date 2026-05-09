@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QLabel, QStatusBar, QMenu, QMenuBar, QSizePolicy, QStyledItemDelegate,
     QStyleOptionViewItem, QDialog, QHBoxLayout, QListWidget, QListWidgetItem,
     QPushButton, QLineEdit, QInputDialog, QGridLayout, QFrame, QPlainTextEdit,
+    QComboBox,
 )
 from PySide6.QtPrintSupport import QPrinter, QPrintDialog, QPrintPreviewDialog
 from PySide6.QtGui import QPageLayout
@@ -1460,56 +1461,36 @@ OLLAMA_URL = "http://localhost:11434/api/chat"
 CALL_SHEET_SYSTEM_PROMPT = """You are a JSON data extractor. You ONLY output valid JSON. No explanations, no markdown, no commentary. Just a single JSON object matching EXACTLY the schema provided."""
 
 
-def _build_import_prompt():
-    """Build the user prompt with a tight schema and example."""
-    return """Extract ALL call sheet data from the text below into EXACTLY this JSON structure.
+def _get_snippet_guide(snippet_name):
+    """Extract the guide section for a specific snippet from the import guide."""
+    if not IMPORT_GUIDE_PATH.exists():
+        return None
+    guide = IMPORT_GUIDE_PATH.read_text()
+    # Find the section for this snippet
+    marker = f"## {snippet_name}"
+    start = guide.find(marker)
+    if start < 0:
+        return None
+    # Find the next ## section or end of file
+    next_section = guide.find("\n## ", start + len(marker))
+    if next_section < 0:
+        section = guide[start:]
+    else:
+        section = guide[start:next_section]
+    return section.strip()
 
-REQUIRED OUTPUT FORMAT:
-{
-  "header": {
-    "title": "SHOW NAME - CALL SHEET - X Pages",
-    "shoot_day": "Day X of Y",
-    "date": "Tuesday, May 5, 2026",
-    "general_call": "9:00 AM",
-    "first_location": "Location Name, Address",
-    "lunch": "3:00 PM",
-    "wrap_target": "9:45 PM"
-  },
-  "scenes": [
-    {"scene_num": "62", "description": "BAR BACK ROOM — Claire confronts", "int_ext": "INT", "day_night": "D5", "pages": "7/8", "cast": "1, 4", "location_notes": "Greenville VFW"}
-  ],
-  "cast": [
-    {"number": "1", "actor": "Grace Patterson", "character": "Claire Bennett", "status": "SW", "set_call": "9:00 AM", "hmu": "8:00 AM", "phone": "555-0100", "notes": "Lead"}
-  ],
-  "crew": [
-    {"position": "Director", "name": "John Smith", "phone": "555-0200", "call_time": "9:00 AM"}
-  ],
-  "key_personnel": {
-    "director": {"name": "", "phone": ""},
-    "producer1": {"name": "", "phone": ""},
-    "producer2": {"name": "", "phone": ""},
-    "first_ad": {"name": "", "phone": ""},
-    "second_ad": {"name": "", "phone": ""},
-    "loc_mgr": {"name": "", "phone": ""}
-  },
-  "weather": {
-    "sunrise": "", "sunset": "", "high": "", "low": "",
-    "precip": "", "condition": "",
-    "hospital_name": "", "hospital_address": "", "hospital_phone": "",
-    "alert": ""
-  },
-  "shooting_order": "SC 62 -> SC 49 -> SC 26 -> Company Move -> SC 27",
-  "notes": {
-    "props": "", "wardrobe": "", "vehicles": "", "bg_atmosphere": ""
-  }
-}
 
-RULES:
-- Extract EVERY scene, cast member, and crew member — do not skip any
-- Include ALL crew from both left and right columns
-- Use "" for missing fields, never null
-- Keep exact names, phone numbers, and times from the source
-- scenes, cast, and crew are arrays — include ALL entries
+def _build_snippet_prompt(snippet_name):
+    """Build AI prompt for filling a specific snippet."""
+    guide_section = _get_snippet_guide(snippet_name)
+    if not guide_section:
+        return None
+
+    return f"""You are extracting data to fill a spreadsheet snippet.
+
+{guide_section}
+
+Return ONLY the JSON object with cell references as keys. Use "" for any field not found. No explanation.
 
 Text:
 """
@@ -1684,6 +1665,77 @@ def _parse_call_sheet_data(raw_text, log_fn=None):
     if log_fn:
         log_fn(f"Full response length: {len(response)} chars")
     return None
+
+
+def _fill_snippet_cells(wb, cell_data, sheet_index=0):
+    """Fill cells in a workbook using cell-reference keys like {"A1": "value", "G2": "value"}.
+
+    Returns the workbook.
+    """
+    ws = wb.worksheets[sheet_index] if sheet_index < len(wb.worksheets) else wb.active
+    for ref, value in cell_data.items():
+        if value:  # skip empty strings
+            try:
+                ws[ref].value = value
+            except (ValueError, KeyError):
+                pass
+    return wb
+
+
+def _import_to_snippet(snippet_name, source_text, log_fn=None):
+    """Extract data from source text and fill a snippet. Returns a workbook."""
+    prompt = _build_snippet_prompt(snippet_name)
+    if not prompt:
+        if log_fn:
+            log_fn(f"No import guide section found for '{snippet_name}'")
+        return None
+
+    if log_fn:
+        log_fn(f"Extracting data for: {snippet_name}")
+
+    response = _query_ollama(CALL_SHEET_SYSTEM_PROMPT, prompt + source_text,
+                             progress_fn=log_fn)
+
+    if response.startswith("[Ollama"):
+        if log_fn:
+            log_fn(response)
+        return None
+
+    # Strip think blocks
+    import re
+    cleaned = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL).strip()
+
+    # Parse JSON
+    start = cleaned.find("{")
+    end = cleaned.rfind("}") + 1
+    if start < 0 or end <= start:
+        if log_fn:
+            log_fn(f"No JSON found in response ({len(response)} chars)")
+        return None
+
+    try:
+        cell_data = json.loads(cleaned[start:end])
+    except json.JSONDecodeError as e:
+        if log_fn:
+            log_fn(f"JSON parse error: {e}")
+        return None
+
+    if log_fn:
+        log_fn(f"Got {len(cell_data)} cell values")
+        for ref, val in cell_data.items():
+            if val:
+                log_fn(f"  {ref} = {val}")
+
+    # Load the snippet as a workbook and fill
+    path = SNIPPETS_DIR / f"{snippet_name}.xlsx"
+    if not path.exists():
+        if log_fn:
+            log_fn(f"Snippet file not found: {path}")
+        return None
+
+    wb = openpyxl.load_workbook(str(path))
+    _fill_snippet_cells(wb, cell_data)
+    return wb
 
 
 def _fill_call_sheet(data):
@@ -1914,17 +1966,32 @@ class DropZoneLabel(QLabel):
 
 
 class ImportCallSheetDialog(QDialog):
-    """Dialog that imports files, extracts text, queries Ollama, and fills a call sheet."""
+    """Dialog that imports files, extracts text via AI, and fills a snippet."""
 
     def __init__(self, files=None, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Import Call Sheet Data")
-        self.setMinimumSize(550, 400)
+        self.setWindowTitle("Import Data to Snippet")
+        self.setMinimumSize(550, 450)
         self.files = list(files) if files else []
         self.result_wb = None
         self._processing = False
 
         layout = QVBoxLayout(self)
+
+        # Snippet selector
+        snippet_row = QHBoxLayout()
+        snippet_row.addWidget(QLabel("Fill snippet:"))
+        self.snippet_combo = QComboBox()
+        # Only show snippets that have a guide section
+        for name in list_snippets():
+            if _get_snippet_guide(name):
+                self.snippet_combo.addItem(name)
+        if self.snippet_combo.count() == 0:
+            # Show all snippets if no guide sections exist yet
+            for name in list_snippets():
+                self.snippet_combo.addItem(name)
+        snippet_row.addWidget(self.snippet_combo, 1)
+        layout.addLayout(snippet_row)
 
         # Drop zone
         self.drop_zone = DropZoneLabel()
@@ -2011,15 +2078,23 @@ class ImportCallSheetDialog(QDialog):
         QApplication.processEvents()
 
     def _run_import(self):
+        snippet_name = self.snippet_combo.currentText()
+        if not snippet_name:
+            self._log("No snippet selected.")
+            return
+
         # Step 1: Extract text from all files
-        self.status_label.setText("Step 1/3: Extracting text from files...")
+        self.status_label.setText("Step 1/2: Extracting text from files...")
         QApplication.processEvents()
 
         all_text = []
         for f in self.files:
             self._log(f"Reading: {Path(f).name}")
             text = _extract_text_from_file(f)
-            if text and not text.startswith("[XLSX Error") and not text.startswith("[OCR Error") and not text.startswith("[PDF Error") and not text.startswith("[Unsupported") and not text.startswith("[Could not") and not text.startswith("[No text"):
+            is_error = (not text or text.startswith("[XLSX Error")
+                       or text.startswith("[OCR Error") or text.startswith("[PDF Error")
+                       or text.startswith("[Unsupported") or text.startswith("[No text"))
+            if text and not is_error:
                 all_text.append(text)
                 self._log(f"  Extracted {len(text)} characters")
             else:
@@ -2033,32 +2108,17 @@ class ImportCallSheetDialog(QDialog):
         combined = "\n\n---\n\n".join(all_text)
         self._log(f"Total text: {len(combined)} characters")
 
-        # Step 2: Parse with Ollama
-        self.status_label.setText(f"Step 2/3: Parsing with {OLLAMA_MODEL} (this may take a moment)...")
+        # Step 2: Fill snippet with AI
+        self.status_label.setText(f"Step 2/2: Filling '{snippet_name}' with {OLLAMA_MODEL}...")
         QApplication.processEvents()
-        self._log(f"Sending to {OLLAMA_MODEL}...")
 
-        data = _parse_call_sheet_data(combined, log_fn=self._log)
+        wb = _import_to_snippet(snippet_name, combined, log_fn=self._log)
 
-        if data is None:
-            self._log("Failed to parse structured data from AI response.")
-            self.status_label.setText("Import failed — could not parse AI response.")
+        if wb is None:
+            self.status_label.setText("Import failed.")
             return
 
-        crew_count = len(data.get("crew", []))
-        self._log(f"Parsed: {crew_count} crew members")
-        if data.get("production"):
-            self._log(f"Production: {data['production']}")
-
-        # Step 3: Build call sheet
-        self.status_label.setText("Step 3/3: Building call sheet...")
-        QApplication.processEvents()
-
-        # Build from snippets with dynamic row expansion
-        self.result_wb = _fill_call_sheet(data)
-        self._log(f"Call sheet built from snippets with {crew_count} crew, "
-                  f"{len(data.get('scenes', []))} scenes, "
-                  f"{len(data.get('cast', []))} cast.")
+        self.result_wb = wb
         self.status_label.setText("Import complete!")
         self.cancel_btn.setText("Done")
         self.cancel_btn.clicked.disconnect()
