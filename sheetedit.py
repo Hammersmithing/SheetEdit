@@ -1785,9 +1785,23 @@ class SnippetRulesEditor(QDialog):
         self._snippet_list = QListWidget()
         self._snippet_list.currentRowChanged.connect(self._snippet_selected)
         left_layout.addWidget(self._snippet_list)
+        btn_row = QHBoxLayout()
+        btn_row.setContentsMargins(0, 0, 0, 0)
+        btn_row.setSpacing(2)
+        add_btn = QPushButton("+")
+        add_btn.setToolTip("Add snippet from selection")
+        add_btn.setFixedWidth(30)
+        add_btn.clicked.connect(self._add_snippet)
+        btn_row.addWidget(add_btn)
         rename_btn = QPushButton("Rename")
         rename_btn.clicked.connect(self._rename_snippet)
-        left_layout.addWidget(rename_btn)
+        btn_row.addWidget(rename_btn)
+        del_btn = QPushButton("−")
+        del_btn.setToolTip("Delete snippet")
+        del_btn.setFixedWidth(30)
+        del_btn.clicked.connect(self._delete_snippet)
+        btn_row.addWidget(del_btn)
+        left_layout.addLayout(btn_row)
         splitter.addWidget(left)
 
         # Middle panel: spreadsheet preview
@@ -2002,6 +2016,65 @@ class SnippetRulesEditor(QDialog):
             item.setText(f"{name}  ({count})")
         else:
             item.setText(name)
+
+    def _add_snippet(self):
+        """Save the current selection from the main sheet as a new snippet."""
+        parent_win = self.parent()
+        if not parent_win or not hasattr(parent_win, '_selected_range'):
+            QMessageBox.information(self, "Add Snippet",
+                "Close this editor, select cells in the spreadsheet, then use 'Save Selection as Snippet'.")
+            return
+        rng = parent_win._selected_range()
+        if rng is None:
+            QMessageBox.information(self, "Add Snippet",
+                "No cells selected in the main spreadsheet.\n"
+                "Close this editor, select cells, then reopen.")
+            return
+        r1, c1, r2, c2 = rng
+        name, ok = QInputDialog.getText(self, "Add Snippet", "Snippet name:")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        if (SNIPPETS_DIR / f"{name}.xlsx").exists():
+            QMessageBox.warning(self, "Add Snippet", f'A snippet named "{name}" already exists.')
+            return
+        sv = parent_win._sheet()
+        if sv is None:
+            return
+        save_snippet(name, sv, r1, c1, r2, c2)
+        # Add to internal state and list
+        self._all_rules[name] = {}
+        item = QListWidgetItem()
+        item.setData(Qt.UserRole, name)
+        item.setText(name)
+        self._snippet_list.addItem(item)
+        self._snippet_list.setCurrentItem(item)
+
+    def _delete_snippet(self):
+        """Delete the currently selected snippet and all its sidecar files."""
+        row = self._snippet_list.currentRow()
+        if row < 0:
+            return
+        item = self._snippet_list.item(row)
+        name = item.data(Qt.UserRole)
+        reply = QMessageBox.question(
+            self, "Delete Snippet",
+            f'Delete snippet "{name}" and all its rules? This cannot be undone.',
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        # Delete all sidecar files
+        for ext in [".xlsx", ".meta.json", ".guide.json", ".guide.md"]:
+            p = SNIPPETS_DIR / f"{name}{ext}"
+            if p.exists():
+                p.unlink()
+        # Remove from internal state
+        self._all_rules.pop(name, None)
+        if self._snippet_name == name:
+            self._snippet_name = None
+            self._current_ref = None
+        self._snippet_list.takeItem(row)
 
     def _rename_snippet(self):
         """Rename the currently selected snippet and all its sidecar files."""
