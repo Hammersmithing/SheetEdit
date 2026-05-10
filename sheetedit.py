@@ -1881,13 +1881,9 @@ class SnippetRulesEditor(QDialog):
         for name in snippets:
             rules = _load_snippet_rules_json(name)
             self._all_rules[name] = rules
-            cell_count = sum(1 for k, v in rules.items() if k != "_description" and v)
             item = QListWidgetItem()
             item.setData(Qt.UserRole, name)
-            if cell_count > 0:
-                item.setText(f"{name}  ({cell_count})")
-            else:
-                item.setText(name)
+            item.setText(name)
             self._snippet_list.addItem(item)
 
     def _snippet_selected(self, row):
@@ -2004,18 +2000,13 @@ class SnippetRulesEditor(QDialog):
         self._status_label.setText(f"{count} cell(s) have rules defined")
 
     def _update_list_label(self):
-        """Update the current snippet's list item to reflect rule count."""
+        """Update the current snippet's list item text."""
         row = self._snippet_list.currentRow()
         if row < 0:
             return
         item = self._snippet_list.item(row)
         name = item.data(Qt.UserRole)
-        rules = self._all_rules.get(name, {})
-        count = sum(1 for k, v in rules.items() if k != "_description" and v)
-        if count > 0:
-            item.setText(f"{name}  ({count})")
-        else:
-            item.setText(name)
+        item.setText(name)
 
     def _add_snippet(self):
         """Save the current selection from the main sheet as a new snippet."""
@@ -3407,6 +3398,7 @@ class SheetEditWindow(QMainWindow):
         if ok and name:
             row, col = sv.currentRow(), sv.currentColumn()
             insert_snippet(name, sv, row, col)
+            sv.scrollToItem(sv.item(row, col))
             self.statusBar().showMessage(f"Inserted snippet: {name}")
 
     def _open_snippet_rules_picker(self):
