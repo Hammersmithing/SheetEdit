@@ -1752,39 +1752,52 @@ def _compile_import_guide():
 
 
 class SnippetRulesEditor(QDialog):
-    """Visual editor: mini spreadsheet on left, cell rule editor on right."""
+    """Visual editor for all snippets: list on left, spreadsheet in middle, rule editor on right."""
 
-    def __init__(self, snippet_name, parent=None):
+    def __init__(self, snippet_name=None, parent=None):
         super().__init__(parent)
-        self._snippet_name = snippet_name
-        self._rules = _load_snippet_rules_json(snippet_name)
+        self._snippet_name = None
+        self._rules = {}
         self._current_ref = None
-        self.setWindowTitle(f"Snippet Rules — {snippet_name}")
-        self.resize(900, 500)
+        self.setWindowTitle("Snippet Rules Editor")
+        self.resize(1100, 600)
 
         main_layout = QVBoxLayout(self)
 
-        # Description at top
+        # Top: description row (updates per snippet)
         desc_row = QHBoxLayout()
         desc_row.addWidget(QLabel("Description:"))
         self._desc_edit = QLineEdit()
         self._desc_edit.setPlaceholderText("Brief description of this snippet (optional)")
-        self._desc_edit.setText(self._rules.get("_description", ""))
         desc_row.addWidget(self._desc_edit)
         main_layout.addLayout(desc_row)
 
-        # Splitter: spreadsheet left, rule editor right
+        # Three-panel splitter
         splitter = QSplitter(Qt.Horizontal)
 
-        # Left: mini spreadsheet
+        # Left panel: snippet list
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        list_label = QLabel("Snippets")
+        list_label.setStyleSheet("font-weight: bold; font-size: 13px;")
+        left_layout.addWidget(list_label)
+        self._snippet_list = QListWidget()
+        self._snippet_list.currentRowChanged.connect(self._snippet_selected)
+        left_layout.addWidget(self._snippet_list)
+        rename_btn = QPushButton("Rename")
+        rename_btn.clicked.connect(self._rename_snippet)
+        left_layout.addWidget(rename_btn)
+        splitter.addWidget(left)
+
+        # Middle panel: spreadsheet preview
         self._table = QTableWidget()
         self._table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._table.setSelectionMode(QTableWidget.SingleSelection)
         self._table.currentCellChanged.connect(self._cell_selected)
-        self._load_snippet_preview()
         splitter.addWidget(self._table)
 
-        # Right: rule editor panel
+        # Right panel: cell rule editor
         right = QWidget()
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(8, 0, 0, 0)
@@ -1805,19 +1818,18 @@ class SnippetRulesEditor(QDialog):
         self._rule_edit.setFont(QFont("Menlo", 12))
         self._rule_edit.setPlaceholderText(
             "Describe what data goes here.\n"
-            "e.g. \"Production title, formatted as TITLE - CALL SHEET - X Pages\""
+            'e.g. "Production title, formatted as TITLE - CALL SHEET - X Pages"'
         )
         self._rule_edit.textChanged.connect(self._rule_text_changed)
         right_layout.addWidget(self._rule_edit)
 
-        # Status: show which cells have rules
         self._status_label = QLabel("")
         self._status_label.setStyleSheet("color: #5F6368; font-size: 11px;")
         self._status_label.setWordWrap(True)
         right_layout.addWidget(self._status_label)
 
         splitter.addWidget(right)
-        splitter.setSizes([450, 450])
+        splitter.setSizes([160, 500, 340])
         main_layout.addWidget(splitter)
 
         # Buttons
@@ -1829,17 +1841,79 @@ class SnippetRulesEditor(QDialog):
             "font-weight: bold; padding: 6px 20px; border-radius: 4px; }"
             "QPushButton:hover { background-color: #1557B0; }"
         )
-        save_btn.clicked.connect(self._save)
+        save_btn.clicked.connect(self._save_all)
         btn_row.addWidget(save_btn)
-        cancel_btn = QPushButton("Cancel")
-        cancel_btn.clicked.connect(self.reject)
-        btn_row.addWidget(cancel_btn)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.reject)
+        btn_row.addWidget(close_btn)
         main_layout.addLayout(btn_row)
 
+        # Populate snippet list
+        self._all_rules = {}  # {snippet_name: rules_dict}
+        self._populate_snippets()
+
+        # Select the requested snippet, or the first one
+        if snippet_name:
+            for i in range(self._snippet_list.count()):
+                if self._snippet_list.item(i).data(Qt.UserRole) == snippet_name:
+                    self._snippet_list.setCurrentRow(i)
+                    break
+        elif self._snippet_list.count() > 0:
+            self._snippet_list.setCurrentRow(0)
+
+    def _populate_snippets(self):
+        """Fill the snippet list with all available snippets."""
+        snippets = list_snippets()
+        for name in snippets:
+            rules = _load_snippet_rules_json(name)
+            self._all_rules[name] = rules
+            cell_count = sum(1 for k, v in rules.items() if k != "_description" and v)
+            item = QListWidgetItem()
+            item.setData(Qt.UserRole, name)
+            if cell_count > 0:
+                item.setText(f"{name}  ({cell_count})")
+            else:
+                item.setText(name)
+            self._snippet_list.addItem(item)
+
+    def _snippet_selected(self, row):
+        """Switch to a different snippet."""
+        # Save current snippet's description before switching
+        self._commit_current()
+
+        if row < 0 or row >= self._snippet_list.count():
+            return
+        name = self._snippet_list.item(row).data(Qt.UserRole)
+        self._snippet_name = name
+        self._rules = self._all_rules.get(name, {})
+        self._current_ref = None
+
+        # Update description
+        self._desc_edit.setText(self._rules.get("_description", ""))
+
+        # Reset right panel
+        self._ref_label.setText("Select a cell")
+        self._val_label.setText("")
+        self._rule_edit.blockSignals(True)
+        self._rule_edit.setPlainText("")
+        self._rule_edit.blockSignals(False)
+
+        # Load spreadsheet preview
+        self._load_snippet_preview()
         self._update_status()
+
+    def _commit_current(self):
+        """Save in-memory state for the current snippet before switching."""
+        if self._snippet_name and self._snippet_name in self._all_rules:
+            self._all_rules[self._snippet_name]["_description"] = self._desc_edit.text().strip()
 
     def _load_snippet_preview(self):
         """Load the snippet xlsx into the mini spreadsheet."""
+        self._table.clear()
+        self._table.setRowCount(0)
+        self._table.setColumnCount(0)
+        if not self._snippet_name:
+            return
         path = SNIPPETS_DIR / f"{self._snippet_name}.xlsx"
         if not path.exists():
             return
@@ -1858,65 +1932,113 @@ class SnippetRulesEditor(QDialog):
                 item = _xl_cell_to_item(cell)
                 item.setFlags(item.flags() & ~Qt.ItemIsEditable)
                 ref = f"{get_column_letter(cell.column)}{cell.row}"
-                # Highlight cells that have rules
                 if ref in self._rules and self._rules[ref]:
                     item.setBackground(QBrush(QColor("#E8F0FE")))
                 self._table.setItem(r, c, item)
-        # Column widths
         for ci in range(cols):
             col_letter = get_column_letter(ci + 1)
             if col_letter in ws.column_dimensions:
                 w = ws.column_dimensions[col_letter].width
                 if w:
                     self._table.setColumnWidth(ci, xl_col_width_to_px(w))
-        # Row heights
         for ri in range(rows):
             if (ri + 1) in ws.row_dimensions:
                 h = ws.row_dimensions[ri + 1].height
                 if h:
                     self._table.setRowHeight(ri, int(h * 1.33))
-        # Merges
         for mg in ws.merged_cells.ranges:
             r1, c1, r2, c2 = mg.min_row - 1, mg.min_col - 1, mg.max_row - 1, mg.max_col - 1
             self._table.setSpan(r1, c1, r2 - r1 + 1, c2 - c1 + 1)
 
     def _cell_selected(self, row, col, prev_row, prev_col):
         """Update right panel when a cell is clicked."""
+        if row < 0 or col < 0:
+            return
         ref = f"{get_column_letter(col + 1)}{row + 1}"
         self._current_ref = ref
         self._ref_label.setText(ref)
         item = self._table.item(row, col)
         val = item.text() if item else ""
         self._val_label.setText(f"Current value: {val}" if val else "(empty cell)")
-        # Load existing rule
         self._rule_edit.blockSignals(True)
         self._rule_edit.setPlainText(self._rules.get(ref, ""))
         self._rule_edit.blockSignals(False)
 
     def _rule_text_changed(self):
         """Save rule text back to dict as user types."""
-        if not self._current_ref:
+        if not self._current_ref or not self._snippet_name:
             return
         self._rules[self._current_ref] = self._rule_edit.toPlainText()
         # Update cell highlight
         ref = self._current_ref
-        col_idx = column_index_from_string(ref.rstrip("0123456789")) - 1
-        row_idx = int(ref.lstrip("ABCDEFGHIJKLMNOPQRSTUVWXYZ")) - 1
-        item = self._table.item(row_idx, col_idx)
-        if item:
-            if self._rule_edit.toPlainText().strip():
-                item.setBackground(QBrush(QColor("#E8F0FE")))
-            else:
-                item.setBackground(QBrush(QColor("#FFFFFF")))
+        try:
+            col_idx = column_index_from_string(ref.rstrip("0123456789")) - 1
+            row_idx = int(ref.lstrip("ABCDEFGHIJKLMNOPQRSTUVWXYZ")) - 1
+            item = self._table.item(row_idx, col_idx)
+            if item:
+                if self._rule_edit.toPlainText().strip():
+                    item.setBackground(QBrush(QColor("#E8F0FE")))
+                else:
+                    item.setBackground(QBrush(QColor("#FFFFFF")))
+        except Exception:
+            pass
         self._update_status()
+        self._update_list_label()
 
     def _update_status(self):
         count = sum(1 for k, v in self._rules.items() if k != "_description" and v)
         self._status_label.setText(f"{count} cell(s) have rules defined")
 
-    def _save(self):
-        self._rules["_description"] = self._desc_edit.text().strip()
-        _save_snippet_rules_json(self._snippet_name, self._rules)
+    def _update_list_label(self):
+        """Update the current snippet's list item to reflect rule count."""
+        row = self._snippet_list.currentRow()
+        if row < 0:
+            return
+        item = self._snippet_list.item(row)
+        name = item.data(Qt.UserRole)
+        rules = self._all_rules.get(name, {})
+        count = sum(1 for k, v in rules.items() if k != "_description" and v)
+        if count > 0:
+            item.setText(f"{name}  ({count})")
+        else:
+            item.setText(name)
+
+    def _rename_snippet(self):
+        """Rename the currently selected snippet and all its sidecar files."""
+        row = self._snippet_list.currentRow()
+        if row < 0:
+            return
+        item = self._snippet_list.item(row)
+        old_name = item.data(Qt.UserRole)
+        new_name, ok = QInputDialog.getText(
+            self, "Rename Snippet", "New name:", text=old_name
+        )
+        if not ok or not new_name.strip() or new_name.strip() == old_name:
+            return
+        new_name = new_name.strip()
+        # Check for conflict
+        if (SNIPPETS_DIR / f"{new_name}.xlsx").exists():
+            QMessageBox.warning(self, "Rename", f'A snippet named "{new_name}" already exists.')
+            return
+        # Rename all sidecar files
+        for ext in [".xlsx", ".meta.json", ".guide.json", ".guide.md"]:
+            old_path = SNIPPETS_DIR / f"{old_name}{ext}"
+            if old_path.exists():
+                old_path.rename(SNIPPETS_DIR / f"{new_name}{ext}")
+        # Update internal state
+        rules = self._all_rules.pop(old_name, {})
+        self._all_rules[new_name] = rules
+        if self._snippet_name == old_name:
+            self._snippet_name = new_name
+        # Update list item
+        item.setData(Qt.UserRole, new_name)
+        self._update_list_label()
+
+    def _save_all(self):
+        """Save all snippet rules and compile the import guide."""
+        self._commit_current()
+        for name, rules in self._all_rules.items():
+            _save_snippet_rules_json(name, rules)
         _compile_import_guide()
         self.accept()
 
@@ -2759,7 +2881,7 @@ class SheetEditWindow(QMainWindow):
     def __init__(self, filepath=None):
         super().__init__()
         self.setWindowTitle("SheetEdit")
-        self.resize(1200, 800)
+        self.resize(1400, 800)
         self.setAcceptDrops(True)
         self.wb = None
         self.filepath = None
@@ -3064,9 +3186,15 @@ class SheetEditWindow(QMainWindow):
 
         tb.addSeparator()
 
+        # Insert Snippet
+        insert_snip_act = QAction("Insert Snippet", self)
+        insert_snip_act.setToolTip("Insert a snippet at the current cell")
+        insert_snip_act.triggered.connect(self._toolbar_insert_snippet)
+        tb.addAction(insert_snip_act)
+
         # Snippet Rules
         rules_act = QAction("Snippet Rules", self)
-        rules_act.setToolTip("Edit import rules for a snippet")
+        rules_act.setToolTip("Edit import rules for snippets")
         rules_act.triggered.connect(self._open_snippet_rules_picker)
         tb.addAction(rules_act)
 
@@ -3192,21 +3320,33 @@ class SheetEditWindow(QMainWindow):
         compile_act.triggered.connect(self._compile_all_rules)
         self._rules_menu.addAction(compile_act)
 
+    def _toolbar_insert_snippet(self):
+        sv = self._sheet()
+        if sv is None:
+            return
+        snippets = list_snippets()
+        if not snippets:
+            QMessageBox.information(self, "Insert Snippet", "No snippets saved yet.")
+            return
+        name, ok = QInputDialog.getItem(
+            self, "Insert Snippet", "Choose a snippet:", snippets, 0, False
+        )
+        if ok and name:
+            row, col = sv.currentRow(), sv.currentColumn()
+            insert_snippet(name, sv, row, col)
+            self.statusBar().showMessage(f"Inserted snippet: {name}")
+
     def _open_snippet_rules_picker(self):
+        self._open_snippet_rules()
+
+    def _open_snippet_rules(self, snippet_name=None):
         snippets = list_snippets()
         if not snippets:
             QMessageBox.information(self, "Snippet Rules", "No snippets saved yet.")
             return
-        name, ok = QInputDialog.getItem(
-            self, "Snippet Rules", "Choose a snippet:", snippets, 0, False
-        )
-        if ok and name:
-            self._open_snippet_rules(name)
-
-    def _open_snippet_rules(self, snippet_name):
         dlg = SnippetRulesEditor(snippet_name, self)
         if dlg.exec() == QDialog.Accepted:
-            self.statusBar().showMessage(f"Import rules saved for {snippet_name} — guide compiled")
+            self.statusBar().showMessage("Import rules saved — guide compiled")
 
     def _compile_all_rules(self):
         _compile_import_guide()
@@ -4177,6 +4317,11 @@ QToolBar::separator {
     width: 1px;
     background-color: #DADCE0;
     margin: 4px 4px;
+}
+QToolBarExtension {
+    background-color: #F1F3F4;
+    border: none;
+    padding: 2px;
 }
 QTabWidget::pane {
     border: none;
