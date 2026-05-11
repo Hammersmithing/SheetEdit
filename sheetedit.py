@@ -581,14 +581,16 @@ def insert_snippet(name, sv, dest_r, dest_c):
             cells.append((dest_r + ri, dest_c + ci))
     sv.push_undo(cells)
 
+    # Batch updates to avoid rendering glitches
+    sv.setUpdatesEnabled(False)
+    sv.blockSignals(True)
+
     # Insert cells
-    sv._tracking_edits = False
     for ri in range(rows):
         for ci in range(cols):
             cell = ws.cell(row=ri + 1, column=ci + 1)
             item = _xl_cell_to_item(cell)
             sv.setItem(dest_r + ri, dest_c + ci, item)
-    sv._tracking_edits = True
 
     # Column widths
     for ci in range(cols):
@@ -615,6 +617,10 @@ def insert_snippet(name, sv, dest_r, dest_c):
         new_c2 = dest_c + mc2
         sv.setSpan(new_r1, new_c1, new_r2 - new_r1 + 1, new_c2 - new_c1 + 1)
         sv.merges.append((new_r1, new_c1, new_r2, new_c2))
+
+    sv.blockSignals(False)
+    sv.setUpdatesEnabled(True)
+    sv.viewport().update()
 
 
 def list_snippets():
