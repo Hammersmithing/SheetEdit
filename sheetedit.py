@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtPrintSupport import QPrinter, QPrintDialog, QPrintPreviewDialog
 from PySide6.QtGui import QPageLayout
-from PySide6.QtCore import Qt, QSize, QRect, QRectF, QModelIndex, QPointF
+from PySide6.QtCore import Qt, QSize, QRect, QRectF, QModelIndex, QPointF, QTimer
 from PySide6.QtGui import (
     QAction, QColor, QFont, QBrush, QIcon, QKeySequence, QPainter, QPen,
     QShortcut, QFontMetrics,
@@ -835,6 +835,15 @@ class SheetView(QTableWidget):
         self.itemChanged.connect(self._on_item_changed)
         self.currentCellChanged.connect(self._cell_moved)
         self._tracking_edits = True
+        # Track column/row resize for undo (debounced so one drag = one undo)
+        self.horizontalHeader().sectionResized.connect(self._col_resized)
+        self.verticalHeader().sectionResized.connect(self._row_resized)
+        self._resize_tracking = True
+        self._resize_pending = None  # ("col"|"row", index, original_size)
+        self._resize_timer = QTimer()
+        self._resize_timer.setSingleShot(True)
+        self._resize_timer.setInterval(300)
+        self._resize_timer.timeout.connect(self._flush_resize)
 
     def _snapshot_cells(self, cells):
         """Capture current state of a list of (row, col) cells."""
@@ -884,7 +893,7 @@ class SheetView(QTableWidget):
     def push_undo(self, cells):
         """Save current state of cells for undo. Call BEFORE making changes."""
         snap = self._snapshot_cells(cells)
-        self._undo_stack.append(snap)
+        self._undo_stack.append(("cells", snap))
         if len(self._undo_stack) > self._MAX_UNDO:
             self._undo_stack.pop(0)
         self._redo_stack.clear()
@@ -892,22 +901,92 @@ class SheetView(QTableWidget):
         if hasattr(win, '_dirty'):
             win._dirty = True
 
+    def _push_undo_entry(self, entry):
+        """Push a raw undo entry (any type)."""
+        self._undo_stack.append(entry)
+        if len(self._undo_stack) > self._MAX_UNDO:
+            self._undo_stack.pop(0)
+        self._redo_stack.clear()
+
     def undo(self):
+        self._flush_resize()
         if not self._undo_stack:
             return
-        old_snap = self._undo_stack.pop()
-        # Save current state for redo
-        current = self._snapshot_cells(old_snap.keys())
-        self._redo_stack.append(current)
-        self._restore_snapshot(old_snap)
+        entry = self._undo_stack.pop()
+        kind = entry[0]
+        if kind == "cells":
+            old_snap = entry[1]
+            current = self._snapshot_cells(old_snap.keys())
+            self._redo_stack.append(("cells", current))
+            self._restore_snapshot(old_snap)
+        elif kind == "col_resize":
+            _, col, old_w = entry
+            cur_w = self.columnWidth(col)
+            self._redo_stack.append(("col_resize", col, cur_w))
+            self._resize_tracking = False
+            self.setColumnWidth(col, old_w)
+            self._resize_tracking = True
+        elif kind == "row_resize":
+            _, row, old_h = entry
+            cur_h = self.rowHeight(row)
+            self._redo_stack.append(("row_resize", row, cur_h))
+            self._resize_tracking = False
+            self.setRowHeight(row, old_h)
+            self._resize_tracking = True
 
     def redo(self):
+        self._flush_resize()
         if not self._redo_stack:
             return
-        new_snap = self._redo_stack.pop()
-        current = self._snapshot_cells(new_snap.keys())
-        self._undo_stack.append(current)
-        self._restore_snapshot(new_snap)
+        entry = self._redo_stack.pop()
+        kind = entry[0]
+        if kind == "cells":
+            new_snap = entry[1]
+            current = self._snapshot_cells(new_snap.keys())
+            self._undo_stack.append(("cells", current))
+            self._restore_snapshot(new_snap)
+        elif kind == "col_resize":
+            _, col, new_w = entry
+            cur_w = self.columnWidth(col)
+            self._undo_stack.append(("col_resize", col, cur_w))
+            self._resize_tracking = False
+            self.setColumnWidth(col, new_w)
+            self._resize_tracking = True
+        elif kind == "row_resize":
+            _, row, new_h = entry
+            cur_h = self.rowHeight(row)
+            self._undo_stack.append(("row_resize", row, cur_h))
+            self._resize_tracking = False
+            self.setRowHeight(row, new_h)
+            self._resize_tracking = True
+
+    def _col_resized(self, col, old_size, new_size):
+        if not self._resize_tracking:
+            return
+        # Only capture the original size at the start of a drag
+        if self._resize_pending is None or self._resize_pending[:2] != ("col", col):
+            self._flush_resize()  # flush any previous pending resize
+            self._resize_pending = ("col", col, old_size)
+        self._resize_timer.start()
+
+    def _row_resized(self, row, old_size, new_size):
+        if not self._resize_tracking:
+            return
+        if self._resize_pending is None or self._resize_pending[:2] != ("row", row):
+            self._flush_resize()
+            self._resize_pending = ("row", row, old_size)
+        self._resize_timer.start()
+
+    def _flush_resize(self):
+        """Commit the pending resize as a single undo entry."""
+        if self._resize_pending is None:
+            return
+        kind, idx, orig = self._resize_pending
+        self._resize_pending = None
+        if kind == "col":
+            self._push_undo_entry(("col_resize", idx, orig))
+        else:
+            self._push_undo_entry(("row_resize", idx, orig))
 
     def copy_cells(self):
         """Copy selected cells to internal clipboard."""
