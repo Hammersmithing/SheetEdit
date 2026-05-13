@@ -557,6 +557,13 @@ def insert_snippet(name, sv, dest_r, dest_c):
     path = SNIPPETS_DIR / f"{name}.xlsx"
     if not path.exists():
         return
+    # currentRow/currentColumn return -1 when no cell is selected (e.g. fresh
+    # workbook). Clamp to 0 so the snippet anchors at A1 instead of silently
+    # dropping the first row/column.
+    if dest_r < 0:
+        dest_r = 0
+    if dest_c < 0:
+        dest_c = 0
     wb = openpyxl.load_workbook(str(path))
     ws = wb.active
 
