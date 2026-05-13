@@ -581,12 +581,20 @@ def insert_snippet(name, sv, dest_r, dest_c):
             [get_column_letter(c + 1) for c in range(sv.columnCount())]
         )
 
-    # Push undo for destination area
-    cells = []
-    for ri in range(rows):
-        for ci in range(cols):
-            cells.append((dest_r + ri, dest_c + ci))
-    sv.push_undo(cells)
+    # Collect coords/cols/rows the insertion will touch, for a single
+    # "snippet_insert" undo entry that reverses the whole operation atomically.
+    cell_coords = [(dest_r + ri, dest_c + ci)
+                   for ri in range(rows) for ci in range(cols)]
+    touched_cols = [dest_c + ci for ci in range(cols)
+                    if get_column_letter(ci + 1) in ws.column_dimensions
+                    and ws.column_dimensions[get_column_letter(ci + 1)].width]
+    touched_rows = [dest_r + ri for ri in range(rows)
+                    if (ri + 1) in ws.row_dimensions
+                    and ws.row_dimensions[ri + 1].height]
+
+    before_cells = sv._snapshot_cells(cell_coords)
+    before_col_widths = {c: sv.columnWidth(c) for c in touched_cols}
+    before_row_heights = {r: sv.rowHeight(r) for r in touched_rows}
 
     # Batch updates to avoid rendering glitches
     sv.setUpdatesEnabled(False)
@@ -614,7 +622,8 @@ def insert_snippet(name, sv, dest_r, dest_c):
             if h:
                 sv.setRowHeight(dest_r + ri, xl_row_height_to_px(h))
 
-    # Merges offset to destination
+    # Merges offset to destination — track them for undo
+    merges_added = []
     for rng in ws.merged_cells.ranges:
         mr1, mc1 = rng.min_row - 1, rng.min_col - 1
         mr2, mc2 = rng.max_row - 1, rng.max_col - 1
@@ -624,10 +633,28 @@ def insert_snippet(name, sv, dest_r, dest_c):
         new_c2 = dest_c + mc2
         sv.setSpan(new_r1, new_c1, new_r2 - new_r1 + 1, new_c2 - new_c1 + 1)
         sv.merges.append((new_r1, new_c1, new_r2, new_c2))
+        merges_added.append((new_r1, new_c1, new_r2, new_c2))
 
     sv.blockSignals(False)
     sv.setUpdatesEnabled(True)
     sv.viewport().update()
+
+    after_cells = sv._snapshot_cells(cell_coords)
+    after_col_widths = {c: sv.columnWidth(c) for c in touched_cols}
+    after_row_heights = {r: sv.rowHeight(r) for r in touched_rows}
+
+    sv._push_undo_entry(("snippet_insert", {
+        "before_cells": before_cells,
+        "after_cells": after_cells,
+        "merges_added": merges_added,
+        "before_col_widths": before_col_widths,
+        "after_col_widths": after_col_widths,
+        "before_row_heights": before_row_heights,
+        "after_row_heights": after_row_heights,
+    }))
+    win = sv.window()
+    if hasattr(win, '_dirty'):
+        win._dirty = True
 
 
 def list_snippets():
@@ -940,6 +967,9 @@ class SheetView(QTableWidget):
             self._resize_tracking = False
             self.setRowHeight(row, old_h)
             self._resize_tracking = True
+        elif kind == "snippet_insert":
+            self._apply_snippet_state(entry[1], direction="undo")
+            self._redo_stack.append(entry)
 
     def redo(self):
         self._flush_resize()
@@ -966,6 +996,52 @@ class SheetView(QTableWidget):
             self._resize_tracking = False
             self.setRowHeight(row, new_h)
             self._resize_tracking = True
+        elif kind == "snippet_insert":
+            self._apply_snippet_state(entry[1], direction="redo")
+            self._undo_stack.append(entry)
+
+    def _apply_snippet_state(self, data, direction):
+        """Reverse or replay a snippet insertion in one atomic step.
+
+        direction="undo": restore pre-insert cells + remove the merges that
+        the insertion added. direction="redo": restore post-insert cells +
+        re-add those merges.
+        """
+        if direction == "undo":
+            cells = data["before_cells"]
+            col_widths = data["before_col_widths"]
+            row_heights = data["before_row_heights"]
+            remove_merges = True
+        else:
+            cells = data["after_cells"]
+            col_widths = data["after_col_widths"]
+            row_heights = data["after_row_heights"]
+            remove_merges = False
+        self.setUpdatesEnabled(False)
+        self.blockSignals(True)
+        self._restore_snapshot(cells)
+        added = data["merges_added"]
+        if remove_merges:
+            for m in added:
+                if m in self.merges:
+                    self.merges.remove(m)
+        else:
+            for m in added:
+                if m not in self.merges:
+                    self.merges.append(m)
+        self.clearSpans()
+        for m in self.merges:
+            if m[2] > m[0] or m[3] > m[1]:
+                self.setSpan(m[0], m[1], m[2] - m[0] + 1, m[3] - m[1] + 1)
+        self._resize_tracking = False
+        for c, w in col_widths.items():
+            self.setColumnWidth(c, w)
+        for r, h in row_heights.items():
+            self.setRowHeight(r, h)
+        self._resize_tracking = True
+        self.blockSignals(False)
+        self.setUpdatesEnabled(True)
+        self.viewport().update()
 
     def _col_resized(self, col, old_size, new_size):
         if not self._resize_tracking:
