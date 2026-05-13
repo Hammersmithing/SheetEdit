@@ -1893,6 +1893,7 @@ class SnippetRulesEditor(QDialog):
         self._table = QTableWidget()
         self._table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._table.setSelectionMode(QTableWidget.SingleSelection)
+        self._table.setItemDelegate(BorderDelegate(self._table))
         self._table.currentCellChanged.connect(self._cell_selected)
         splitter.addWidget(self._table)
 
@@ -2028,7 +2029,7 @@ class SnippetRulesEditor(QDialog):
                 item.setFlags(item.flags() & ~Qt.ItemIsEditable)
                 ref = f"{get_column_letter(cell.column)}{cell.row}"
                 if ref in self._rules and self._rules[ref]:
-                    item.setBackground(QBrush(QColor("#E8F0FE")))
+                    item.setData(RULE_ROLE, True)
                 self._table.setItem(r, c, item)
         for ci in range(cols):
             col_letter = get_column_letter(ci + 1)
@@ -3560,16 +3561,10 @@ class SheetEditWindow(QMainWindow):
                 files.append(path)
         if not files:
             return
-        # If it's a single .xlsx, just open it normally
+        # A single .xlsx always opens as a spreadsheet — never auto-import.
         if len(files) == 1 and Path(files[0]).suffix.lower() == ".xlsx":
-            reply = QMessageBox.question(
-                self, "Open or Import?",
-                f"Open \"{Path(files[0]).name}\" as a spreadsheet, or import as call sheet data?",
-                QMessageBox.Open | QMessageBox.Apply,
-            )
-            if reply == QMessageBox.Open:
-                self.open_file(files[0])
-                return
+            self.open_file(files[0])
+            return
         self._import_call_sheet(files)
 
     def _open_dialog(self):
