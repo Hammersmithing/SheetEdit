@@ -852,7 +852,7 @@ class SheetView(QTableWidget):
         self.merges = []
         self._undo_stack = []
         self._redo_stack = []
-        self._MAX_UNDO = 50
+        self._MAX_UNDO = 500
         self.setItemDelegate(BorderDelegate(self))
         self.setShowGrid(True)  # light grid from stylesheet, borders drawn on top
         # Google Sheets-style: typing goes straight into cells,
