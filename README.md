@@ -24,11 +24,27 @@ A lightweight .xlsx spreadsheet editor built with PySide6 and openpyxl. Designed
 
 ## Running
 
+### Install to /Applications (default)
+
+Build a standalone `.app` bundle with PyInstaller and copy it to `/Applications/`:
+
 ```bash
-python sheetedit.py
+source .venv/bin/activate
+pyinstaller --noconfirm SheetEdit.spec
+rm -rf /Applications/SheetEdit.app
+cp -R dist/SheetEdit.app /Applications/
 ```
 
-Or install the bundled app to `/Applications/SheetEdit.app` via PyInstaller.
+Then launch from Spotlight, Launchpad, or the Applications folder. This is the recommended workflow — re-run those four commands after pulling changes to update.
+
+### Run from source
+
+For quick iteration without rebuilding:
+
+```bash
+source .venv/bin/activate
+python sheetedit.py [file.xlsx]
+```
 
 ## Future Development
 
