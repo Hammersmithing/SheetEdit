@@ -3181,6 +3181,13 @@ class SheetEditWindow(QMainWindow):
         open_act.triggered.connect(self._open_dialog)
         file_menu.addAction(open_act)
 
+        close_act = QAction("Close Window", self)
+        close_act.setShortcut(QKeySequence.Close)
+        close_act.triggered.connect(self.close)
+        file_menu.addAction(close_act)
+
+        file_menu.addSeparator()
+
         save_act = QAction("Save", self)
         save_act.setShortcut(QKeySequence.Save)
         save_act.triggered.connect(self._save)
